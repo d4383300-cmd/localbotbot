@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -32,7 +32,6 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Локальные структуры памяти
 cached_admins = set()
 last_admin_fetch = 0
 user_messages = {}
@@ -44,7 +43,6 @@ class Registration(StatesGroup):
     age = State()
     confirm = State()
 
-# --- Кэш Администраторов ---
 async def refresh_admin_cache():
     global cached_admins, last_admin_fetch
     try:
@@ -52,14 +50,30 @@ async def refresh_admin_cache():
         cached_admins = {admin.user.id for admin in admins}
         last_admin_fetch = time.time()
     except Exception as e:
-        print(f"Ошибка получения админов: {e}")
+        print(f"Ошибка админов: {e}")
 
 def is_admin(user_id: int) -> bool:
     if user_id == LEYMIK_ID:
         return True
     return user_id in cached_admins
 
-# 1. Выдача прав администратора боту
+def format_duration(start_dt: datetime) -> str:
+    now = datetime.utcnow()
+    diff = now - start_dt
+    days = diff.days
+    if days < 30:
+        return f"{days} дн."
+    elif days < 365:
+        months = days // 30
+        rem_days = days % 30
+        return f"{months} мес. {rem_days} дн."
+    else:
+        years = days // 365
+        rem_months = (days % 365) // 30
+        return f"{years} г. {rem_months} мес."
+
+# --- События статуса бота и приветствие ---
+
 @dp.my_chat_member()
 async def bot_rights_updated(event: types.ChatMemberUpdated):
     if event.chat.id == TARGET_CHAT_ID and event.new_chat_member.status == ChatMemberStatus.ADMINISTRATOR:
@@ -70,7 +84,6 @@ async def bot_rights_updated(event: types.ChatMemberUpdated):
             parse_mode=ParseMode.HTML
         )
 
-# 2. Приветствие новичков
 @dp.message(F.chat.id == TARGET_CHAT_ID, F.new_chat_members)
 async def welcome_members(message: types.Message):
     for member in message.new_chat_members:
@@ -82,7 +95,8 @@ async def welcome_members(message: types.Message):
             parse_mode=ParseMode.HTML
         )
 
-# 3. Анкеты в ЛС
+# --- Анкеты в ЛС ---
+
 @dp.message(F.chat.type == "private", CommandStart())
 async def start_cmd(message: types.Message, state: FSMContext):
     if db.is_blocked(message.from_user.id):
@@ -171,7 +185,6 @@ async def confirm_form(cb: types.CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
 
-# Причина отклонения от Леймика в ЛС
 @dp.message(F.chat.type == "private")
 async def private_messages_router(message: types.Message):
     user_id = message.from_user.id
@@ -185,9 +198,8 @@ async def private_messages_router(message: types.Message):
             )
             await message.reply("✅ Причина отправлена кандидату.")
         except Exception:
-            await message.reply("⚠️ Не удалось отправить причину (возможно, бот заблокирован кандидатом).")
+            await message.reply("⚠️ Не удалось доставить сообщение кандидату.")
 
-# Решения по заявкам (только Леймик)
 @dp.callback_query(F.data.startswith("adm_"))
 async def process_admin_decision(cb: types.CallbackQuery):
     if cb.from_user.id != LEYMIK_ID:
@@ -228,7 +240,49 @@ async def process_admin_decision(cb: types.CallbackQuery):
 
     await cb.answer()
 
-# 4. Модерация и игровой процесс в группе
+# --- КНОПКИ ДЛЯ БРАКА ---
+
+@dp.callback_query(F.data.startswith("marry_"))
+async def process_marriage_callback(cb: types.CallbackQuery):
+    parts = cb.data.split("_")
+    action = parts[1]
+    proposer_id = int(parts[2])
+    target_id = int(parts[3])
+
+    if cb.from_user.id != target_id:
+        return await cb.answer("💍 Это предложение адресовано не тебе!", show_alert=True)
+
+    proposer = db.get_user(proposer_id)
+    target = db.get_user(target_id)
+
+    if action == "yes":
+        db.create_marriage(
+            proposer_id, proposer["first_name"],
+            target_id, target["first_name"]
+        )
+        await cb.message.edit_text(
+            f"✨ <b>СВЯЩЕННЫЙ СОЮЗ ЗАКЛЮЧЁН!</b> ✨\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💍 <b><a href='tg://user?id={proposer_id}'>{proposer['first_name']}</a></b> и "
+            f"<b><a href='tg://user?id={target_id}'>{target['first_name']}</a></b> теперь официально в браке!\n\n"
+            f"🎉 Поздравляем молодоженов! Горько! 🥂💫\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await cb.message.edit_text(
+            f"💔 <b>ГОРЕЧЬ И РАЗОЧАРОВАНИЕ...</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🥀 <b><a href='tg://user?id={target_id}'>{target['first_name']}</a></b> ответил(а) отказом на предложение "
+            f"<b><a href='tg://user?id={proposer_id}'>{proposer['first_name']}</a></b>.\n"
+            f"Сердце разбито, но жизнь в Localhaus продолжается... 🌧️\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML
+        )
+    await cb.answer()
+
+# --- ОСНОВНОЙ ЧАТ ---
+
 @dp.message(F.chat.id == TARGET_CHAT_ID)
 async def handle_chat_message(message: types.Message):
     global last_admin_fetch
@@ -236,7 +290,10 @@ async def handle_chat_message(message: types.Message):
     text = message.text or message.caption or ""
     lower_text = text.lower().strip()
 
-    # Тихое авто-обновление админов раз в 10 минут
+    # Фиксация активности для топа
+    db.get_user(user_id, message.from_user.username or "", message.from_user.first_name)
+    db.record_message(user_id)
+
     if time.time() - last_admin_fetch > 600:
         await refresh_admin_cache()
 
@@ -245,16 +302,14 @@ async def handle_chat_message(message: types.Message):
     if message.from_user.username:
         db.save_member(user_id, message.from_user.username)
 
-    # --- Проверка онлайна ---
     if lower_text == "бот ты тут?":
         return await message.reply("Да")
 
-    # --- Правила ---
     if lower_text == "правила":
         return await message.reply(
             "📜 <b>ПРАВИЛА ЧАТА LOCALHAUS</b> 📜\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "1️⃣ <b>Спам лесенкой</b>: больше 5 сообщений за 3 сек — Мут 5 мин.\n"
+            "1️⃣ <b>Спам лесенкой</b>: больше 5 сообщений за 3 сек — Предупреждение / Мут 5 мин.\n"
             "2️⃣ <b>Спам стикерами</b>: удаление стикеров + Предупреждение.\n"
             "3️⃣ <b>Ссылки и реклама</b>: 1 раз — варн, 2 раза за день — Бан.\n"
             "4️⃣ <b>18+ контент</b>: порнография/шок — Варн / Бан.\n"
@@ -284,7 +339,7 @@ async def handle_chat_message(message: types.Message):
                 parse_mode=ParseMode.HTML
             )
 
-    # --- Спам лесенкой (более 5 сообщений за 3 сек) ---
+    # --- Спам текстом лесенкой (> 5 сообщений за 3 сек) ---
     if not user_admin:
         now = time.time()
         history = user_messages.get(user_id, [])
@@ -304,13 +359,14 @@ async def handle_chat_message(message: types.Message):
                     until_date=until
                 )
                 return await message.answer(
-                    f"🔇 <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> получил мут на 5 минут за спам лесенкой!",
+                    f"⚠️ <b>ВНИМАНИЕ!</b>\n"
+                    f"🔇 <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> получает предупреждение и мут на 5 минут за спам лесенкой!",
                     parse_mode=ParseMode.HTML
                 )
             except Exception:
                 pass
 
-    # --- Ссылки и реклама ---
+    # --- Анти-ссылки ---
     url_pattern = r"(https?://\S+|t\.me/\S+|www\.\S+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b)"
     if re.search(url_pattern, text) and not user_admin:
         try:
@@ -333,6 +389,114 @@ async def handle_chat_message(message: types.Message):
                 f"⚠️ <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a>, ссылки запрещены! (Предупреждение 1/2 за день)",
                 parse_mode=ParseMode.HTML
             )
+
+    # --- ФУНКЦИЯ БРАКОВ: "брак" и "браки" ---
+
+    if lower_text == "брак":
+        if not message.reply_to_message:
+            return await message.reply("💍 Ответь этой командой на сообщение того, кому хочешь сделать предложение!")
+        
+        target = message.reply_to_message.from_user
+        if target.id == user_id:
+            return await message.reply("😅 Нельзя заключить брак с самим собой!")
+        if target.id == bot.id:
+            return await message.reply("🤖 Я всего лишь скромный бот, моё сердце занято кодом!")
+
+        target_data = db.get_user(target.id, target.username or "", target.first_name)
+        
+        if db.get_marriage(user_id):
+            return await message.reply("⚠️ Ты уже состоишь в законном браке!")
+        if db.get_marriage(target.id):
+            return await message.reply(f"💔 <a href='tg://user?id={target.id}'>{target.first_name}</a> уже в браке с другим человеком!", parse_mode=ParseMode.HTML)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💖 Согласиться", callback_data=f"marry_yes_{user_id}_{target.id}"),
+                InlineKeyboardButton(text="💔 Отказаться", callback_data=f"marry_no_{user_id}_{target.id}")
+            ]
+        ])
+
+        return await message.answer(
+            f"💍 <b>МИНУТОЧКУ ВНИМАНИЯ!</b> 💍\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌹 <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> искренне и с трепетом делает предложение руки и сердца "
+            f"<a href='tg://user?id={target.id}'>{target.first_name}</a>!\n\n"
+            f"<i>Ждём решения второй половинки... согласны ли вы связать свои судьбы в Localhaus?</i> ✨\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
+        )
+
+    if lower_text == "браки":
+        marriages = db.get_all_marriages()
+        if not marriages:
+            return await message.reply("🕊️ В чате пока нет ни одной супружеской пары. Будьте первыми!")
+
+        lines = ["💍 <b>СЕМЕЙНЫЙ СОЮЗ LOCALHAUS</b> 💍\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for idx, m in enumerate(marriages, 1):
+            dt = datetime.strptime(m["married_at"].split(".")[0], "%Y-%m-%d %H:%M:%S")
+            duration = format_duration(dt)
+            lines.append(
+                f"{idx}. <b><a href='tg://user?id={m['user1_id']}'>{m['user1_name']}</a></b> 💖 "
+                f"<b><a href='tg://user?id={m['user2_id']}'>{m['user2_name']}</a></b> — вместе уже <b>{duration}</b>"
+            )
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        return await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    # --- ПЕРЕДАЧА ЛИСТОЧКОВ: "п (число)" ---
+
+    transfer_match = re.match(r"^п\s+(\d+)$", lower_text)
+    if transfer_match:
+        if not message.reply_to_message:
+            return await message.reply("🍁 Ответь этой командой на сообщение того, кому переводишь листочки!")
+        
+        target = message.reply_to_message.from_user
+        if target.id == user_id:
+            return await message.reply("😅 Переводить листочки самому себе бессмысленно!")
+        if target.id == bot.id:
+            return await message.reply("🍃 Спасибо, но боту валюта не нужна!")
+
+        amount = int(transfer_match.group(1))
+        if amount <= 0:
+            return await message.reply("⚠️ Сумма перевода должна быть больше 0!")
+
+        sender = db.get_user(user_id, message.from_user.username or "", message.from_user.first_name)
+        if sender["balance"] < amount:
+            return await message.reply(f"❌ <b>Недостаточно листочек!</b> Твой баланс: <b>{sender['balance']}</b> 🍁", parse_mode=ParseMode.HTML)
+
+        db.get_user(target.id, target.username or "", target.first_name)
+        new_sender_bal = db.update_balance(user_id, -amount)
+        new_target_bal = db.update_balance(target.id, amount)
+
+        return await message.answer(
+            f"💸 <b>УСПЕШНЫЙ ПЕРЕВОД ЛИСТОЧЕК</b> 🍁\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Отправитель: <b><a href='tg://user?id={user_id}'>{message.from_user.first_name}</a></b>\n"
+            f"🎁 Получатель: <b><a href='tg://user?id={target.id}'>{target.first_name}</a></b>\n"
+            f"💰 Сумма: <b>{amount}</b> 🍁 листочек\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Остаток на балансе: <b>{new_sender_bal}</b> 🍁",
+            parse_mode=ParseMode.HTML
+        )
+
+    # --- СТАТИСТИКА СООБЩЕНИЙ ЗА ДЕНЬ: "стата" ---
+
+    if lower_text == "стата":
+        top_users = db.get_top_daily(5)
+        if not top_users:
+            return await message.reply("📊 Сегодня еще никто не проявлял активности.")
+
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        lines = [
+            "🏆 <b>ТОП-5 АКТИВА ЗА ДЕНЬ В LOCALHAUS</b> 🏆\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ]
+        for idx, u in enumerate(top_users):
+            medal = medals[idx] if idx < len(medals) else f"{idx+1}."
+            lines.append(f"{medal} <b><a href='tg://user?id={u['user_id']}'>{u['first_name']}</a></b> — <b>{u['msg_count']}</b> сообщ.")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━\n🎁 <i>Лидер дня по итогам суток получает +500 🍁 листочек!</i>")
+        return await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
     # --- Баланс ---
     if lower_text in ["б", "баланс"]:
@@ -366,8 +530,8 @@ async def handle_chat_message(message: types.Message):
             return await message.reply(
                 f"🎰 <b>РУЛЕТКА LOCALHAUS</b> 🎰\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                f"🎯 Выбор: <b>{chosen_name}</b>\n"
-                f"🎲 Выпало: <b>{outcome_name}</b>\n\n"
+                f"🎯 Выбор: <b>${chosen_name}</b>\n"
+                f"🎲 Выпало: <b>${outcome_name}</b>\n\n"
                 f"🔥 <b>ПОБЕДА (2x)!</b> Выигрыш: <b>+{bet_amount}</b> 🍁 листочек!\n"
                 f"💰 Новый баланс: <b>{new_bal}</b> 🍁",
                 parse_mode=ParseMode.HTML
@@ -377,14 +541,14 @@ async def handle_chat_message(message: types.Message):
             return await message.reply(
                 f"🎰 <b>РУЛЕТКА LOCALHAUS</b> 🎰\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                f"🎯 Выбор: <b>{chosen_name}</b>\n"
-                f"🎲 Выпало: <b>{outcome_name}</b>\n\n"
+                f"🎯 Выбор: <b>${chosen_name}</b>\n"
+                f"🎲 Выпало: <b>${outcome_name}</b>\n\n"
                 f"💀 <b>ПОРАЖЕНИЕ (0x)!</b> Ставка сгорела.\n"
                 f"💰 Новый баланс: <b>{new_bal}</b> 🍁",
                 parse_mode=ParseMode.HTML
             )
 
-    # --- Случайный дроп (Шанс 5%) ---
+    # --- Дроп за активность (5%) ---
     if random.random() < 0.05:
         reward = random.randint(10, 30)
         db.update_balance(user_id, reward)
@@ -393,7 +557,7 @@ async def handle_chat_message(message: types.Message):
             parse_mode=ParseMode.HTML
         )
 
-    # --- Команды Администратора ---
+    # --- АДМИН КОМАНДЫ ---
     if not user_admin:
         return
 
@@ -436,6 +600,25 @@ async def handle_chat_message(message: types.Message):
         except Exception:
             await message.reply("⚠️ Ошибка при выдаче мута.")
 
+    elif lower_text == "размут":
+        if not message.reply_to_message:
+            return await message.reply("⚠️ Ответьте этой командой на сообщение того, кого хотите размутить!")
+        target = message.reply_to_message.from_user
+        try:
+            await bot.restrict_chat_member(
+                TARGET_CHAT_ID,
+                target.id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True
+                )
+            )
+            await message.reply(f"🔊 С пользователя <a href='tg://user?id={target.id}'>{target.first_name}</a> сняты все ограничения!", parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply("⚠️ Ошибка при снятии мута.")
+
     elif lower_text == "калл":
         members = db.get_all_members()
         if not members:
@@ -443,7 +626,31 @@ async def handle_chat_message(message: types.Message):
         tags = " ".join([f"@{u}" for u in members])
         await message.answer(f"📢 <b>ОБЩИЙ СБОР ЧАТА!</b>\n\n{tags}", parse_mode=ParseMode.HTML)
 
-# --- Задача Keep-Alive (Самопинг) ---
+# --- ЕЖЕДНЕВНАЯ ВЫДАЧА НАГРАДЫ ЗА ТОП-1 (500 листочек) ---
+async def daily_reward_checker():
+    while True:
+        await asyncio.sleep(60)
+        yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        if not db.is_reward_given(yesterday_str):
+            top_user = db.get_yesterday_top()
+            if top_user and top_user["msg_count"] > 0:
+                db.update_balance(top_user["user_id"], 500)
+                try:
+                    await bot.send_message(
+                        TARGET_CHAT_ID,
+                        f"👑 <b>ИТОГИ ДНЯ: САМЫЙ АКТИВНЫЙ УЧАСТНИК!</b> 👑\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🥇 Вчера лидером общения стал(а) <b><a href='tg://user?id={top_user['user_id']}'>{top_user['first_name']}</a></b> "
+                        f"с результатом в <b>{top_user['msg_count']}</b> сообщений!\n\n"
+                        f"🎁 Награда: <b>+500</b> 🍁 листочек начислена на баланс! Поздравляем! 🎉\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+            db.mark_reward_given(yesterday_str)
+
+# --- KEEP-ALIVE ТАСКА ---
 async def keep_alive_task():
     await asyncio.sleep(10)
     if not RENDER_EXTERNAL_URL:
@@ -453,19 +660,19 @@ async def keep_alive_task():
         while True:
             try:
                 async with session.get(url) as resp:
-                    print(f"[Keep-Alive] Self-ping status: {resp.status}")
-            except Exception as e:
-                print(f"[Keep-Alive] Ping fail: {e}")
-            await asyncio.sleep(300) # каждые 5 минут
+                    pass
+            except Exception:
+                pass
+            await asyncio.sleep(300)
 
-# --- Webhook & Aiohttp запуск ---
 async def on_startup(app):
     await refresh_admin_cache()
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
-        print(f"Вебхук установлен: {webhook_url}")
+        print(f"Вебхук активен: {webhook_url}")
     asyncio.create_task(keep_alive_task())
+    asyncio.create_task(daily_reward_checker())
 
 async def root_handler(request):
     return web.Response(text="Bot is running!")
