@@ -1,5 +1,7 @@
 require('dotenv').config();
 const express = require('express');
+const https = require('https');
+const http = require('http');
 const { Telegraf, Markup } = require('telegraf');
 const db = require('./database');
 
@@ -8,37 +10,46 @@ const TARGET_CHAT_ID = -1004373765011;
 const LEYMIK_ID = 7505593850;
 const INVITE_LINK = 'https://t.me/+Un85Q4TUznc4YWYy';
 const PORT = process.env.PORT || 3000;
-const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL; // Render URL вида https://your-app.onrender.com
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL; // URL вида https://ваш-проект.onrender.com
 
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 
-// Память для трекинга флуда и состояний анкет
+// Память состояний
 const userMessageHistory = new Map();
 const userStickerHistory = new Map();
 const userForms = new Map();
-const pendingRejections = new Map(); // Ожидание причины отклонения от Леймика
+const pendingRejections = new Map();
 
-// Проверка на права администратора
-async function isAdmin(ctx, userId) {
-  if (userId === LEYMIK_ID) return true;
+// --- ⚡ СВЕРХБЫСТРЫЙ КЭШ АДМИНИСТРАТОРОВ ---
+let cachedAdmins = new Set();
+let lastAdminFetch = 0;
+
+async function refreshAdminCache(telegram) {
   try {
-    const member = await ctx.telegram.getChatMember(TARGET_CHAT_ID, userId);
-    return ['creator', 'administrator'].includes(member.status);
+    const admins = await telegram.getChatAdministrators(TARGET_CHAT_ID);
+    cachedAdmins = new Set(admins.map(a => a.user.id));
+    lastAdminFetch = Date.now();
   } catch (err) {
-    return false;
+    console.error('Ошибка синхронизации админов:', err.message);
   }
 }
 
-// 1. Уведомление при получении прав администратора
+function isAdmin(userId) {
+  if (userId === LEYMIK_ID) return true;
+  return cachedAdmins.has(userId);
+}
+
+// 1. Уведомление при получении прав админа
 bot.on('my_chat_member', async (ctx) => {
   const status = ctx.myChatMember.new_chat_member.status;
   if (ctx.chat.id === TARGET_CHAT_ID && status === 'administrator') {
+    await refreshAdminCache(ctx.telegram);
     await ctx.reply('✨ <b>Права выданы. Готов к работе!</b>', { parse_mode: 'HTML' });
   }
 });
 
-// 2. Приветствие новичков в чате
+// 2. Приветствие новичков
 bot.on('new_chat_members', async (ctx) => {
   if (ctx.chat.id !== TARGET_CHAT_ID) return;
   for (const member of ctx.message.new_chat_members) {
@@ -51,16 +62,16 @@ bot.on('new_chat_members', async (ctx) => {
   }
 });
 
-// 3. Обработка личных сообщений (Анкета вступления)
+// 3. Личные сообщения: Анкета кандидата
 bot.on('message', async (ctx, next) => {
   if (ctx.chat.type === 'private') {
     const userId = ctx.from.id;
 
     if (db.isBlocked(userId)) {
-      return; // Игнорирование заблокированных
+      return; // Заблокированные игнорируются
     }
 
-    // Если Леймик вводит причину отклонения в ЛС
+    // Обработка ввода причины отклонения от Леймика
     if (userId === LEYMIK_ID && pendingRejections.has(LEYMIK_ID)) {
       const targetUserId = pendingRejections.get(LEYMIK_ID);
       pendingRejections.delete(LEYMIK_ID);
@@ -70,9 +81,9 @@ bot.on('message', async (ctx, next) => {
           `❌ <b>Ваша заявка в Localhaus была отклонена.</b>\n💬 <b>Причина:</b> ${ctx.message.text}`,
           { parse_mode: 'HTML' }
         );
-        return ctx.reply('✅ Причина отправлена кандидату.');
+        return ctx.reply('✅ Причина отправлена пользователю.');
       } catch (e) {
-        return ctx.reply('⚠️ Не удалось отправить сообщение кандидату (возможно, бот заблокирован им).');
+        return ctx.reply('⚠️ Не удалось доставить сообщение (возможно, бот заблокирован кандидатом).');
       }
     }
 
@@ -82,7 +93,7 @@ bot.on('message', async (ctx, next) => {
       userForms.set(userId, { step: 'name' });
       return ctx.reply(
         `👋 <b>Приветствуем в приемной Localhaus!</b>\n\n` +
-        `Чтобы получить доступ к чату, заполните короткую анкету.\n` +
+        `Чтобы получить доступ к чату, ответь на пару вопросов.\n` +
         `1️⃣ <b>Как тебя зовут?</b>`,
         { parse_mode: 'HTML' }
       );
@@ -100,14 +111,14 @@ bot.on('message', async (ctx, next) => {
       if (form.step === 'age') {
         const age = parseInt(text, 10);
         if (isNaN(age) || age < 10 || age > 99) {
-          return ctx.reply('⚠️ Пожалуйста, укажи корректный числовой возраст:');
+          return ctx.reply('⚠️ Пожалуйста, укажи реальный возраст числом:');
         }
         form.age = age;
         form.step = 'confirm';
         userForms.set(userId, form);
 
         return ctx.reply(
-          `📋 <b>Проверь свои данные:</b>\n` +
+          `📋 <b>Проверь правильность данных:</b>\n` +
           `• <b>Имя:</b> ${form.name}\n` +
           `• <b>Возраст:</b> ${form.age}\n\n` +
           `<i>С правилами чата обязуешься ознакомиться при входе.</i>\n\n` +
@@ -122,30 +133,29 @@ bot.on('message', async (ctx, next) => {
       }
     }
 
-    return ctx.reply('Используй /start, чтобы подать анкету на вступление.');
+    return ctx.reply('Напиши /start, чтобы начать заполнение анкеты.');
   }
 
-  // Фильтр чатов: в группах слушаем только TARGET_CHAT_ID
+  // Фильтр: если группа не наша — игнорируем
   if (ctx.chat.id !== TARGET_CHAT_ID) return;
   return next();
 });
 
-// Обработка кнопок анкеты кандидатом
+// Кнопка подтверждения анкеты
 bot.action('form_confirm', async (ctx) => {
   const userId = ctx.from.id;
   const form = userForms.get(userId);
-  if (!form) return ctx.answerCbQuery('Анкета не найдена, начните заново.');
+  if (!form) return ctx.answerCbQuery('Анкета устарела, начни заново.');
 
   const appId = db.createApplication(userId, ctx.from.username || '', form.name, form.age);
   userForms.delete(userId);
 
-  await ctx.editMessageText('✅ <b>Твоя заявка успешно отправлена на проверку администрации! Ожидай ответа.</b>', { parse_mode: 'HTML' });
+  await ctx.editMessageText('✅ <b>Твоя заявка отправлена администрации! Ожидай решения.</b>', { parse_mode: 'HTML' });
 
-  // Отправка заявки в целевой чат с тегом Леймика
   await bot.telegram.sendMessage(
     TARGET_CHAT_ID,
-    `📥 <b>НОВАЯ ЗАЯВКА НА ВСТУПЛЕНИЕ!</b>\n\n` +
-    `👤 <b>Кандидат:</b> @${ctx.from.username || 'отсутствует'} (ID: <code>${userId}</code>)\n` +
+    `📥 <b>НОВАЯ ЗАЯВКА В LOCALHAUS!</b>\n\n` +
+    `👤 <b>Кандидат:</b> @${ctx.from.username || 'нет'} (ID: <code>${userId}</code>)\n` +
     `📝 <b>Имя:</b> ${form.name}\n` +
     `🎂 <b>Возраст:</b> ${form.age}\n\n` +
     `Модератор @Leymik, примите решение!`,
@@ -168,7 +178,7 @@ bot.action('form_restart', async (ctx) => {
   await ctx.editMessageText('🔄 Начнем заново.\n\n1️⃣ <b>Как тебя зовут?</b>', { parse_mode: 'HTML' });
 });
 
-// Решения по анкете (только Леймик)
+// Решения Леймика по кнопкам
 bot.action(/adm_(accept|reject|block)_(\d+)_(\d+)/, async (ctx) => {
   const adminId = ctx.from.id;
   const action = ctx.match[1];
@@ -176,12 +186,12 @@ bot.action(/adm_(accept|reject|block)_(\d+)_(\d+)/, async (ctx) => {
   const targetUserId = parseInt(ctx.match[3], 10);
 
   if (adminId !== LEYMIK_ID) {
-    return ctx.answerCbQuery('⛔ Только @Leymik может выносить решение по заявкам!', { show_alert: true });
+    return ctx.answerCbQuery('⛔ Только @Leymik может выносить вердикт!', { show_alert: true });
   }
 
-  const app = db.getApplication(appId);
-  if (!app || app.status !== 'pending') {
-    return ctx.answerCbQuery('Решение по этой заявке уже принято.');
+  const appData = db.getApplication(appId);
+  if (!appData || appData.status !== 'pending') {
+    return ctx.answerCbQuery('Решение уже вынесено.');
   }
 
   if (action === 'accept') {
@@ -189,7 +199,7 @@ bot.action(/adm_(accept|reject|block)_(\d+)_(\d+)/, async (ctx) => {
     try {
       await bot.telegram.sendMessage(
         targetUserId,
-        `🎉 <b>Поздравляем! Ваша заявка в Localhaus одобрена!</b>\n\nВступайте по ссылке:\n${INVITE_LINK}`,
+        `🎉 <b>Твоя заявка в Localhaus одобрена!</b>\n\nСсылка на вход:\n${INVITE_LINK}`,
         { parse_mode: 'HTML' }
       );
     } catch (e) {}
@@ -201,7 +211,7 @@ bot.action(/adm_(accept|reject|block)_(\d+)_(\d+)/, async (ctx) => {
     db.updateAppStatus(appId, 'rejected');
     await ctx.editMessageText(`${ctx.callbackQuery.message.text}\n\n🔴 <b>ОТКЛОНЕНО (@Leymik)</b>`, { parse_mode: 'HTML' });
     try {
-      await bot.telegram.sendMessage(LEYMIK_ID, `Напишите в ответ сообщение с причиной отклонения для заявки #${appId}:`);
+      await bot.telegram.sendMessage(LEYMIK_ID, `Напишите сообщение с причиной отказа для заявки #${appId}:`);
     } catch (e) {}
   }
 
@@ -214,39 +224,46 @@ bot.action(/adm_(accept|reject|block)_(\d+)_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-// 4. Основной процессинг сообщений группы
+// 4. Обработка всех сообщений в чате
 bot.on('message', async (ctx) => {
   if (ctx.chat.id !== TARGET_CHAT_ID) return;
 
   const text = ctx.message.text || ctx.message.caption || '';
   const userId = ctx.from.id;
-  const isUserAdmin = await isAdmin(ctx, userId);
+  const userIsAdmin = isAdmin(userId);
+
+  // Периодическое тихое обновление кэша админов раз в 10 минут
+  if (Date.now() - lastAdminFetch > 10 * 60 * 1000) {
+    refreshAdminCache(ctx.telegram);
+  }
 
   // Запоминаем участника для команды "калл"
   if (ctx.from.username) {
     db.saveMember(userId, ctx.from.username);
   }
 
-  // --- Проверка онлайна ---
+  // --- Бот ты тут? ---
   if (text.toLowerCase() === 'бот ты тут?') {
     return ctx.reply('Да');
   }
 
-  // --- Правила чата ---
+  // --- Правила ---
   if (text.toLowerCase() === 'правила') {
     return ctx.reply(
-      `📜 <b>ПРАВИЛА ЧАТА LOCALHAUS</b> 📜\n\n` +
-      `1️⃣ <b>Флуд и спам лесенкой</b>: запрещено более 5 сообщений подряд за 3 сек (Предупреждение / Мут).\n` +
-      `2️⃣ <b>Спам стикерами</b>: массовая отправка стикеров запрещена (Удаление + Предупреждение).\n` +
-      `3️⃣ <b>Реклама и ссылки</b>: строгий запрет на несогласованные ссылки (1-й раз — Предупреждение, 2-й за день — Бан).\n` +
-      `4️⃣ <b>Контент 18+</b>: мат/порнография/шок-контент карается варном.\n` +
-      `5️⃣ Уважайте участников и администрацию!`,
+      `📜 <b>ПРАВИЛА ЧАТА LOCALHAUS</b> 📜\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `1️⃣ <b>Спам лесенкой</b>: больше 5 сообщений за 3 сек — Мут 5 мин.\n` +
+      `2️⃣ <b>Спам стикерами</b>: удаление стикеров + Предупреждение.\n` +
+      `3️⃣ <b>Ссылки и реклама</b>: 1 раз — предупреждение, 2 раза за день — Бан.\n` +
+      `4️⃣ <b>18+ контент</b>: шок-контент, порнография — Варн / Бан.\n` +
+      `5️⃣ Уважение к участникам и администрации чата.\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━`,
       { parse_mode: 'HTML' }
     );
   }
 
-  // --- Анти-спам стикерами (3+ стикера за 5 сек) ---
-  if (ctx.message.sticker && !isUserAdmin) {
+  // --- Защита от спама стикерами (3+ стикера за 5 сек) ---
+  if (ctx.message.sticker && !userIsAdmin) {
     const now = Date.now();
     let stickers = userStickerHistory.get(userId) || [];
     stickers = stickers.filter(t => now - t.time < 5000);
@@ -266,8 +283,8 @@ bot.on('message', async (ctx) => {
     }
   }
 
-  // --- Анти-спам лесенкой (более 5 сообщений за 3 сек) ---
-  if (!isUserAdmin) {
+  // --- Защита от спама лесенкой (> 5 сообщений за 3 сек) ---
+  if (!userIsAdmin) {
     const now = Date.now();
     let history = userMessageHistory.get(userId) || [];
     history = history.filter(t => now - t < 3000);
@@ -279,16 +296,16 @@ bot.on('message', async (ctx) => {
       try {
         await ctx.deleteMessage();
         await ctx.restrictChatMember(userId, {
-          until_date: Math.floor(Date.now() / 1000) + 300 // 5 минут мута
+          until_date: Math.floor(Date.now() / 1000) + 300 // Мут на 5 минут
         });
-        return ctx.reply(`🔇 Пользователь <a href="tg://user?id=${userId}">${ctx.from.first_name}</a> получил мут на 5 минут за спам лесенкой!`, { parse_mode: 'HTML' });
+        return ctx.reply(`🔇 <a href="tg://user?id=${userId}">${ctx.from.first_name}</a> получил мут на 5 минут за спам лесенкой!`, { parse_mode: 'HTML' });
       } catch (e) {}
     }
   }
 
-  // --- Анти-реклама и ссылки ---
+  // --- Защита от рекламы и ссылок ---
   const urlRegex = /(https?:\/\/[^\s]+|t\.me\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b)/gi;
-  if (urlRegex.test(text) && !isUserAdmin) {
+  if (urlRegex.test(text) && !userIsAdmin) {
     try { await ctx.deleteMessage(); } catch (e) {}
 
     const count = db.checkAndIncrementLinks(userId);
@@ -308,31 +325,30 @@ bot.on('message', async (ctx) => {
   if (lower === 'б' || lower === 'баланс') {
     const user = db.getUser(userId, ctx.from.username, ctx.from.first_name);
     return ctx.reply(
-      `🍃 <b>Баланс пользователя <a href="tg://user?id=${userId}">${ctx.from.first_name}</a>:</b>\n` +
+      `🍃 <b>Кошелек: <a href="tg://user?id=${userId}">${ctx.from.first_name}</a></b>\n` +
       `━━━━━━━━━━━━━━━━\n` +
-      `💰 У вас в кошельке: <b>${user.balance}</b> 🍁 листочек\n` +
+      `💰 Баланс: <b>${user.balance}</b> 🍁 листочек\n` +
       `━━━━━━━━━━━━━━━━`,
       { parse_mode: 'HTML' }
     );
   }
 
-  // --- Казино: Депозит листочек (формат: "50 к" или "100 ч") ---
+  // --- Казино рулетка (например: "50 ч" или "25 к") ---
   const betMatch = lower.match(/^(\d+)\s+([чк])$/);
   if (betMatch) {
     const betAmount = parseInt(betMatch[1], 10);
-    const chosenColor = betMatch[2]; // 'ч' или 'к'
+    const chosenColor = betMatch[2];
     const user = db.getUser(userId, ctx.from.username, ctx.from.first_name);
 
     if (betAmount <= 0) {
       return ctx.reply('⚠️ Ставка должна быть больше 0!');
     }
     if (user.balance < betAmount) {
-      return ctx.reply(`❌ <b>Недостаточно листочек!</b> Твой баланс: <b>${user.balance}</b> 🍁`, { parse_mode: 'HTML' });
+      return ctx.reply(`❌ <b>Недостаточно листочек!</b> Баланс: <b>${user.balance}</b> 🍁`, { parse_mode: 'HTML' });
     }
 
-    // Розыгрыш 50/50
     const colors = ['ч', 'к'];
-    const outcome = colors[Math.floor(Math.random() * colors.length)];
+    const outcome = colors[Math.floor(Math.random() * 2)];
     const outcomeName = outcome === 'ч' ? '⬛ ЧЁРНЫЙ' : '🟥 КРАСНЫЙ';
     const chosenName = chosenColor === 'ч' ? '⬛ ЧЁРНЫЙ' : '🟥 КРАСНЫЙ';
 
@@ -341,10 +357,10 @@ bot.on('message', async (ctx) => {
       return ctx.reply(
         `🎰 <b>РУЛЕТКА LOCALHAUS</b> 🎰\n` +
         `━━━━━━━━━━━━━━━━\n` +
-        `🎯 Твой выбор: <b>${chosenName}</b>\n` +
+        `🎯 Выбор: <b>${chosenName}</b>\n` +
         `🎲 Выпало: <b>${outcomeName}</b>\n\n` +
-        `🔥 <b>ПОБЕДА (2x)!</b> Вы выиграли <b>+${betAmount}</b> 🍁 листочек!\n` +
-        `💰 Твой новый баланс: <b>${newBal}</b> 🍁`,
+        `🔥 <b>ПОБЕДА (2x)!</b> Вы выиграли: <b>+${betAmount}</b> 🍁 листочек!\n` +
+        `💰 Текущий баланс: <b>${newBal}</b> 🍁`,
         { parse_mode: 'HTML' }
       );
     } else {
@@ -352,27 +368,27 @@ bot.on('message', async (ctx) => {
       return ctx.reply(
         `🎰 <b>РУЛЕТКА LOCALHAUS</b> 🎰\n` +
         `━━━━━━━━━━━━━━━━\n` +
-        `🎯 Твой выбор: <b>${chosenName}</b>\n` +
+        `🎯 Выбор: <b>${chosenName}</b>\n` +
         `🎲 Выпало: <b>${outcomeName}</b>\n\n` +
         `💀 <b>ПОРАЖЕНИЕ (0x)!</b> Ставка сгорела.\n` +
-        `💰 Твой новый баланс: <b>${newBal}</b> 🍁`,
+        `💰 Текущий баланс: <b>${newBal}</b> 🍁`,
         { parse_mode: 'HTML' }
       );
     }
   }
 
-  // --- Случайный дроп листочек за активность (Шанс 5%) ---
+  // --- Дроп валюты за активность (Шанс 5%) ---
   if (Math.random() < 0.05) {
-    const reward = Math.floor(Math.random() * 21) + 10; // от 10 до 30
+    const reward = Math.floor(Math.random() * 21) + 10;
     db.updateBalance(userId, reward);
     await ctx.reply(
-      `🍃 <b>Удача!</b> За активность в чате <a href="tg://user?id=${userId}">${ctx.from.first_name}</a> находит <b>${reward}</b> 🍁 листочек!`,
+      `🍃 <b>Удача!</b> За активность <a href="tg://user?id=${userId}">${ctx.from.first_name}</a> получает <b>${reward}</b> 🍁 листочек!`,
       { parse_mode: 'HTML' }
     );
   }
 
   // --- КОМАНДЫ ТОЛЬКО ДЛЯ АДМИНИСТРАТОРОВ ---
-  if (!isUserAdmin) return;
+  if (!userIsAdmin) return;
 
   // Бан по реплаю
   if (lower === 'бан') {
@@ -380,9 +396,9 @@ bot.on('message', async (ctx) => {
     const target = ctx.message.reply_to_message.from;
     try {
       await ctx.banChatMember(target.id);
-      return ctx.reply(`🚫 Администратор исключил и забанил <a href="tg://user?id=${target.id}">${target.first_name}</a>.`, { parse_mode: 'HTML' });
+      return ctx.reply(`🚫 <a href="tg://user?id=${target.id}">${target.first_name}</a> исключен и добавлен в черный список.`, { parse_mode: 'HTML' });
     } catch (e) {
-      return ctx.reply('⚠️ Не удалось забанить пользователя (проверьте права бота).');
+      return ctx.reply('⚠️ Ошибка при бане (проверьте права бота).');
     }
   }
 
@@ -393,25 +409,25 @@ bot.on('message', async (ctx) => {
     try {
       await ctx.banChatMember(target.id);
       await ctx.unbanChatMember(target.id);
-      return ctx.reply(`🚪 <a href="tg://user?id=${target.id}">${target.first_name}</a> был исключен из чата.`, { parse_mode: 'HTML' });
+      return ctx.reply(`🚪 <a href="tg://user?id=${target.id}">${target.first_name}</a> был исключен.`, { parse_mode: 'HTML' });
     } catch (e) {
-      return ctx.reply('⚠️ Не удалось кикнуть пользователя.');
+      return ctx.reply('⚠️ Ошибка при исключении.');
     }
   }
 
-  // Мут по реплаю: "мут [минуты]"
+  // Мут: "мут [минуты]"
   const muteMatch = lower.match(/^мут\s+(\d+)$/);
   if (muteMatch) {
-    if (!ctx.message.reply_to_message) return ctx.reply('⚠️ Ответьте этой командой на сообщение пользователя!');
+    if (!ctx.message.reply_to_message) return ctx.reply('⚠️ Ответьте командой на сообщение нарушителя!');
     const target = ctx.message.reply_to_message.from;
     const minutes = parseInt(muteMatch[1], 10);
     const until = Math.floor(Date.now() / 1000) + minutes * 60;
 
     try {
       await ctx.restrictChatMember(target.id, { until_date: until });
-      return ctx.reply(`🔇 Пользователю <a href="tg://user?id=${target.id}">${target.first_name}</a> выдан мут на <b>${minutes} мин.</b>`, { parse_mode: 'HTML' });
+      return ctx.reply(`🔇 <a href="tg://user?id=${target.id}">${target.first_name}</a> получил мут на <b>${minutes} мин.</b>`, { parse_mode: 'HTML' });
     } catch (e) {
-      return ctx.reply('⚠️ Не удалось ограничить пользователя.');
+      return ctx.reply('⚠️ Ошибка при выдаче мута.');
     }
   }
 
@@ -419,35 +435,46 @@ bot.on('message', async (ctx) => {
   if (lower === 'калл') {
     const members = db.getAllMembers();
     if (members.length === 0) return ctx.reply('Список участников пуст.');
-    
-    // Формируем упоминания порциями
     const tags = members.map(m => `@${m.username}`).join(' ');
-    return ctx.reply(`📢 <b>ОБЩИЙ СБОР!</b>\n\n${tags}`, { parse_mode: 'HTML' });
+    return ctx.reply(`📢 <b>ОБЩИЙ СБОР ЧАТА!</b>\n\n${tags}`, { parse_mode: 'HTML' });
   }
 });
 
-// --- Настройка Webhook и запуск Express ---
+// --- ВЕБХУК И HTTP СЕРВЕР ---
 const WEBHOOK_PATH = `/webhook/${bot.token}`;
-
 app.use(express.json());
 
-// Маршрут для обработки вебхука Telegram
 app.post(WEBHOOK_PATH, (req, res) => {
   bot.handleUpdate(req.body, res);
 });
 
-// Health check для Render (чтобы сервис не падал)
 app.get('/', (req, res) => {
-  res.send('Localhaus Bot is active and running on webhook!');
+  res.send('Localhaus Bot: Status 200 OK (Keep-Alive Active)');
 });
 
+// Запуск приложения
 app.listen(PORT, async () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Server started on port ${PORT}`);
+
+  // Предзагрузка кэша админов
+  await refreshAdminCache(bot.telegram);
+
+  // Настройка Webhook
   if (RENDER_EXTERNAL_URL) {
     const webhookUrl = `${RENDER_EXTERNAL_URL}${WEBHOOK_PATH}`;
     await bot.telegram.setWebhook(webhookUrl);
-    console.log(`Webhook set to: ${webhookUrl}`);
+    console.log(`Webhook successfully set to: ${webhookUrl}`);
+
+    // --- ⏰ СИСТЕМА ПРОТИВ СНА (Self-Ping каждые 8 минут) ---
+    setInterval(() => {
+      const client = RENDER_EXTERNAL_URL.startsWith('https') ? https : http;
+      client.get(RENDER_EXTERNAL_URL, (res) => {
+        console.log(`[Keep-Alive] Ping sent to Render: status ${res.statusCode}`);
+      }).on('error', (err) => {
+        console.error('[Keep-Alive] Ping error:', err.message);
+      });
+    }, 8 * 60 * 1000); // 8 минут
   } else {
-    console.log('RENDER_EXTERNAL_URL is not set. Webhook cannot be auto-configured without domain.');
+    console.warn('⚠️ Переменная RENDER_EXTERNAL_URL не задана!');
   }
 });
