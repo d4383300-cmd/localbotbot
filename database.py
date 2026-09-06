@@ -34,6 +34,30 @@ def init_db():
                 status TEXT DEFAULT 'pending'
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS marriages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user1_id INTEGER UNIQUE,
+                user1_name TEXT,
+                user2_id INTEGER UNIQUE,
+                user2_name TEXT,
+                married_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_activity (
+                user_id INTEGER,
+                date TEXT,
+                msg_count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, date)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reward_history (
+                date TEXT PRIMARY KEY,
+                awarded INTEGER DEFAULT 0
+            )
+        """)
         conn.commit()
 
 def get_user(user_id: int, username: str = "", first_name: str = ""):
@@ -50,6 +74,13 @@ def get_user(user_id: int, username: str = "", first_name: str = ""):
             conn.commit()
             cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             user = cursor.fetchone()
+        else:
+            if username or first_name:
+                cursor.execute(
+                    "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+                    (username or user["username"], first_name or user["first_name"], user_id)
+                )
+                conn.commit()
         return dict(user)
 
 def update_balance(user_id: int, amount: int) -> int:
@@ -129,6 +160,92 @@ def update_app_status(app_id: int, status: str):
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE applications SET status = ? WHERE id = ?", (status, app_id))
+        conn.commit()
+
+# --- ФУНКЦИИ БРАКОВ ---
+
+def get_marriage(user_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM marriages WHERE user1_id = ? OR user2_id = ?",
+            (user_id, user_id)
+        )
+        res = cursor.fetchone()
+        return dict(res) if res else None
+
+def create_marriage(user1_id: int, user1_name: str, user2_id: int, user2_name: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO marriages (user1_id, user1_name, user2_id, user2_name, married_at) VALUES (?, ?, ?, ?, ?)",
+            (user1_id, user1_name, user2_id, user2_name, datetime.utcnow())
+        )
+        conn.commit()
+
+def get_all_marriages():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM marriages ORDER BY married_at ASC")
+        return [dict(row) for row in cursor.fetchall()]
+
+# --- АКТИВНОСТЬ И СТАТИСТИКА СООБЩЕНИЙ ---
+
+def record_message(user_id: int):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO daily_activity (user_id, date, msg_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, date) DO UPDATE SET msg_count = msg_count + 1
+        """, (user_id, today))
+        conn.commit()
+
+def get_top_daily(limit: int = 5):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT d.user_id, d.msg_count, u.first_name, u.username
+            FROM daily_activity d
+            JOIN users u ON d.user_id = u.user_id
+            WHERE d.date = ?
+            ORDER BY d.msg_count DESC
+            LIMIT ?
+        """, (today, limit))
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_yesterday_top():
+    yesterday = (datetime.utcnow() - datetime.resolution).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT d.user_id, d.msg_count, u.first_name
+            FROM daily_activity d
+            JOIN users u ON d.user_id = u.user_id
+            WHERE d.date = ?
+            ORDER BY d.msg_count DESC
+            LIMIT 1
+        """, (yesterday,))
+        res = cursor.fetchone()
+        return dict(res) if res else None
+
+def is_reward_given(date_str: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT awarded FROM reward_history WHERE date = ?", (date_str,))
+        res = cursor.fetchone()
+        return bool(res and res[0] == 1)
+
+def mark_reward_given(date_str: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO reward_history (date, awarded) VALUES (?, 1)", (date_str,))
         conn.commit()
 
 init_db()
