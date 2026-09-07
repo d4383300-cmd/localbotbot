@@ -41,7 +41,7 @@ user_stickers = {}
 pending_rejections = {}
 active_proposals = {}
 
-# Активные математические задачи: { message_id_задачи: { "user_id": int, "answer": int, "expires_at": float } }
+# Активные задачи работы: { message_id: { "user_id": int, "answer": int, "expires_at": float } }
 active_jobs = {}
 
 class Registration(StatesGroup):
@@ -228,7 +228,7 @@ async def process_admin_decision(cb: types.CallbackQuery):
         try:
             await bot.send_message(
                 target_id,
-                f"🎉 <b>Твоя заявка в Localhaus одобрена!</b>\n\nСсылка на вход:\n${INVITE_LINK}",
+                f"🎉 <b>Твоя заявка в Localhaus одобрена!</b>\n\nСсылка на вход:\n{INVITE_LINK}",
                 parse_mode=ParseMode.HTML
             )
         except Exception:
@@ -324,7 +324,7 @@ async def process_paid_rp(cb: types.CallbackQuery):
     )
     await cb.answer()
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
+# --- ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ЧАТА ---
 
 @dp.message(F.chat.id == TARGET_CHAT_ID)
 async def handle_chat_message(message: types.Message):
@@ -333,15 +333,26 @@ async def handle_chat_message(message: types.Message):
     text = message.text or message.caption or ""
     lower_text = text.lower().strip()
 
-    # --- ПРОВЕРКА КАЗИНО 777 (Telegram Dice Slot Machine) ---
+    # --- 🔒 АНТИ-ДЮП КАЗИНО 777 (ПРОВЕРКА НА ПЕРЕСЫЛКУ) ---
     if message.dice and message.dice.emoji == "🎰":
-        # Значение 64 в кубике 🎰 означает выпадение трёх семерок (777)
+        # Проверяем, переслано ли сообщение
+        is_forwarded = bool(
+            message.forward_date or 
+            message.forward_from or 
+            message.forward_from_chat or 
+            getattr(message, 'forward_origin', None)
+        )
+        if is_forwarded:
+            # Пересланный дайс игнорируется! Дюп заблокирован.
+            return
+
+        # Значение 64 в анимации 🎰 — это именно три семерки (777)
         if message.dice.value == 64:
             new_bal = db.update_balance(user_id, 200)
             return await message.reply(
                 f"🎰🔥 <b>ДЖЕКПОТ! ТРИ СЕМЁРКИ (777)!</b> 🔥🎰\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎉 Невероятная удача! <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> выбивает три топора!\n"
+                f"🎉 Честная удача! <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> сам крутанул слот и сорвал джекпот!\n"
                 f"💰 <b>Выигрыш: +200</b> 🍁 листочек на баланс!\n"
                 f"🍃 Текущий кошелек: <b>{new_bal}</b> 🍁\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━",
@@ -372,7 +383,6 @@ async def handle_chat_message(message: types.Message):
             del active_jobs[message.reply_to_message.message_id]
             return await message.reply("⏳ Время на решение (2 минуты) вышло! Пример аннулирован.")
 
-        # Ожидаем только число
         raw_text = text.strip()
         if not re.match(r"^-?\d+$", raw_text):
             return await message.reply("⚠️ Ответ должен содержать <b>только одно число</b> без букв и знаков!", parse_mode=ParseMode.HTML)
@@ -487,6 +497,51 @@ async def handle_chat_message(message: types.Message):
                 parse_mode=ParseMode.HTML
             )
 
+    # --- 👑 УПРАВЛЕНИЕ БАЛАНСОМ (ТОЛЬКО ДЛЯ LEYMIK) ---
+    if user_id == LEYMIK_ID:
+        # Снять баланс
+        remove_match = re.match(r"^снять\s+баланс\s+(\d+)$", lower_text)
+        if remove_match:
+            if not message.reply_to_message:
+                return await message.reply("⚠️ Ответь этой командой на сообщение того, у кого нужно забрать листочки!")
+            target = message.reply_to_message.from_user
+            amount = int(remove_match.group(1))
+            t_data = db.get_user(target.id, target.username or "", target.first_name)
+            
+            # Снимаем не больше чем есть (до нуля)
+            actual_remove = min(amount, t_data["balance"])
+            new_bal = db.update_balance(target.id, -actual_remove)
+            return await message.reply(
+                f"⚖️ <b>ИЗЪЯТИЕ СРЕДСТВ АДМИНИСТРАЦИЕЙ</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👑 Модератор: <b>@Leymik</b>\n"
+                f"👤 Нарушитель: <b><a href='tg://user?id={target.id}'>{target.first_name}</a></b>\n"
+                f"📉 Списано: <b>-{actual_remove}</b> 🍁 листочек\n"
+                f"💰 Текущий остаток игрока: <b>{new_bal}</b> 🍁\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode=ParseMode.HTML
+            )
+
+        # Выдать баланс
+        give_match = re.match(r"^выдать\s+баланс\s+(\d+)$", lower_text)
+        if give_match:
+            if not message.reply_to_message:
+                return await message.reply("⚠️ Ответь этой командой на сообщение того, кому выдать листочки!")
+            target = message.reply_to_message.from_user
+            amount = int(give_match.group(1))
+            db.get_user(target.id, target.username or "", target.first_name)
+            new_bal = db.update_balance(target.id, amount)
+            return await message.reply(
+                f"🎁 <b>ВЫДАЧА СРЕДСТВ АДМИНИСТРАЦИЕЙ</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👑 Модератор: <b>@Leymik</b>\n"
+                f"👤 Получатель: <b><a href='tg://user?id={target.id}'>{target.first_name}</a></b>\n"
+                f"📈 Начислено: <b>+{amount}</b> 🍁 листочек\n"
+                f"💰 Новый баланс игрока: <b>{new_bal}</b> 🍁\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode=ParseMode.HTML
+            )
+
     # --- КОМАНДА "РАБОТА" ---
     if lower_text == "работа":
         num1 = random.randint(100, 99999)
@@ -522,11 +577,12 @@ async def handle_chat_message(message: types.Message):
             f"Люстра люстра няш няш аф аф люблю сочно сучку {target_tag}"
         )
 
-    # --- БЕСПЛАТНЫЕ РП ДЕЙСТВИЯ: ВЫЕБАТЬ, ПОЦЕЛОВАТЬ, ОБНЯТЬ ---
+    # --- БЕСПЛАТНЫЕ РП ДЕЙСТВИЯ: ОБНЯТЬ, ПОЦЕЛОВАТЬ, ВЫЕБАТЬ, ЛИЗЬ ---
     rp_actions = {
-        "обнять": ("обнял(а)", "крепко обнимает и прижимает к себе"),
-        "поцеловать": ("поцеловал(а)", "нежно целует в губы"),
-        "выебать": ("выебал(а)", "жестко и без лишних слов выебал(а)")
+        "обнять": ("обнял(а)", "крепко обнимает и согревает теплом"),
+        "поцеловать": ("поцеловал(а)", "нежно и чувственно целует в губы"),
+        "выебать": ("выебал(а)", "жестко и без лишних прелюдий выебал(а)"),
+        "лизь": ("лизнул(а)", "игриво и влажно лизнул(а) за ушком")
     }
     if lower_text in rp_actions:
         if not message.reply_to_message:
@@ -536,8 +592,8 @@ async def handle_chat_message(message: types.Message):
         return await message.answer(
             f"✨ <b>РП ДЕЙСТВИЕ</b> ✨\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💥 <b><a href='tg://user?id={user_id}'>{message.from_user.first_name}</a></b> {act_desc} "
-            f"<b><a href='tg://user?id={target.id}'>{target.first_name}</a></b>! 🔥\n"
+            f"🐾 <b><a href='tg://user?id={user_id}'>{message.from_user.first_name}</a></b> {act_desc} "
+            f"<b><a href='tg://user?id={target.id}'>{target.first_name}</a></b>! 💖\n"
             f"━━━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML
         )
@@ -783,7 +839,7 @@ async def handle_chat_message(message: types.Message):
             parse_mode=ParseMode.HTML
         )
 
-    # --- АДМИН КОМАНДЫ ---
+    # --- АДМИН КОМАНДЫ ДЛЯ ЧАТА ---
     if not user_admin:
         return
 
@@ -895,7 +951,7 @@ async def midnight_msk_scheduler():
             db.mark_reward_given(ended_day)
         await asyncio.sleep(5)
 
-# --- KEEP-ALIVE ---
+# --- KEEP-ALIVE ТАСКА ДЛЯ RENDER ---
 async def keep_alive_task():
     await asyncio.sleep(10)
     if not RENDER_EXTERNAL_URL:
