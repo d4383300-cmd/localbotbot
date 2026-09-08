@@ -32,6 +32,8 @@ def init_db():
                 links_today INT DEFAULT 0,
                 last_link_date TEXT,
                 is_blocked INT DEFAULT 0,
+                is_deputy INT DEFAULT 0,
+                is_frozen INT DEFAULT 0,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS chat_members (
@@ -65,7 +67,6 @@ def init_db():
                 awarded INT DEFAULT 0
             );
         """)
-        # Автомиграция колонок на случай старой версии таблицы
         cursor.execute("""
             ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
@@ -74,6 +75,8 @@ def init_db():
             ALTER TABLE users ADD COLUMN IF NOT EXISTS links_today INT DEFAULT 0;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS last_link_date TEXT;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked INT DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deputy INT DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_frozen INT DEFAULT 0;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
         """)
     else:
@@ -87,6 +90,8 @@ def init_db():
                 links_today INTEGER DEFAULT 0,
                 last_link_date TEXT,
                 is_blocked INTEGER DEFAULT 0,
+                is_deputy INTEGER DEFAULT 0,
+                is_frozen INTEGER DEFAULT 0,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS chat_members (
@@ -120,6 +125,14 @@ def init_db():
                 awarded INTEGER DEFAULT 0
             );
         """)
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN is_deputy INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN is_frozen INTEGER DEFAULT 0;")
+        except Exception:
+            pass
         conn.commit()
     conn.close()
 
@@ -147,6 +160,24 @@ def get_user(user_id: int, username: str = "", first_name: str = ""):
     res = dict(user)
     conn.close()
     return res
+
+def set_deputy(user_id: int, status: int = 1):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE users SET is_deputy = %s, is_frozen = 0 WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET is_deputy = ?, is_frozen = 0 WHERE user_id = ?"
+    cursor.execute(q, (status, user_id))
+    if mode == "sqlite": conn.commit()
+    conn.close()
+
+def set_frozen(user_id: int, status: int = 1):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE users SET is_frozen = %s WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET is_frozen = ? WHERE user_id = ?"
+    cursor.execute(q, (status, user_id))
+    if mode == "sqlite": conn.commit()
+    conn.close()
 
 def update_balance(user_id: int, amount: int) -> int:
     conn, mode = get_db()
