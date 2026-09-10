@@ -34,6 +34,9 @@ def init_db():
                 is_blocked INT DEFAULT 0,
                 is_deputy INT DEFAULT 0,
                 is_frozen INT DEFAULT 0,
+                referrer_id BIGINT DEFAULT NULL,
+                rubles INT DEFAULT 0,
+                rubles_total INT DEFAULT 0,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS chat_members (
@@ -77,6 +80,9 @@ def init_db():
             ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked INT DEFAULT 0;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deputy INT DEFAULT 0;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS is_frozen INT DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT DEFAULT NULL;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS rubles INT DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS rubles_total INT DEFAULT 0;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
         """)
     else:
@@ -92,6 +98,9 @@ def init_db():
                 is_blocked INTEGER DEFAULT 0,
                 is_deputy INTEGER DEFAULT 0,
                 is_frozen INTEGER DEFAULT 0,
+                referrer_id INTEGER DEFAULT NULL,
+                rubles INTEGER DEFAULT 0,
+                rubles_total INTEGER DEFAULT 0,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS chat_members (
@@ -125,14 +134,11 @@ def init_db():
                 awarded INTEGER DEFAULT 0
             );
         """)
-        try:
-            cursor.execute("ALTER TABLE users ADD COLUMN is_deputy INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-        try:
-            cursor.execute("ALTER TABLE users ADD COLUMN is_frozen INTEGER DEFAULT 0;")
-        except Exception:
-            pass
+        for col in ["is_deputy INTEGER DEFAULT 0", "is_frozen INTEGER DEFAULT 0", "referrer_id INTEGER DEFAULT NULL", "rubles INTEGER DEFAULT 0", "rubles_total INTEGER DEFAULT 0"]:
+            try:
+                cursor.execute(f"ALTER TABLE users ADD COLUMN {col};")
+            except Exception:
+                pass
         conn.commit()
     conn.close()
 
@@ -160,6 +166,33 @@ def get_user(user_id: int, username: str = "", first_name: str = ""):
     res = dict(user)
     conn.close()
     return res
+
+def set_referrer(user_id: int, referrer_id: int):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE users SET referrer_id = %s WHERE user_id = %s AND referrer_id IS NULL" if mode == "pg" else \
+        "UPDATE users SET referrer_id = ? WHERE user_id = ? AND referrer_id IS NULL"
+    cursor.execute(q, (referrer_id, user_id))
+    if mode == "sqlite": conn.commit()
+    conn.close()
+
+def reward_referrer(referrer_id: int, rubles: int = 10):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE users SET rubles = rubles + %s, rubles_total = rubles_total + %s WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET rubles = rubles + ?, rubles_total = rubles_total + ? WHERE user_id = ?"
+    cursor.execute(q, (rubles, rubles, referrer_id))
+    if mode == "sqlite": conn.commit()
+    conn.close()
+
+def get_referrals_count(user_id: int) -> int:
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "SELECT COUNT(*) FROM users WHERE referrer_id = %s" if mode == "pg" else "SELECT COUNT(*) FROM users WHERE referrer_id = ?"
+    cursor.execute(q, (user_id,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
 
 def set_deputy(user_id: int, status: int = 1):
     conn, mode = get_db()
