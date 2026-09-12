@@ -28,11 +28,12 @@ def init_db():
                 username TEXT,
                 first_name TEXT,
                 balance BIGINT DEFAULT 0,
+                atoms BIGINT DEFAULT 0,
                 warns INT DEFAULT 0,
                 links_today INT DEFAULT 0,
                 last_link_date TEXT,
                 is_blocked INT DEFAULT 0,
-                is_deputy INT DEFAULT 0,
+                rank_level INT DEFAULT 0,
                 is_frozen INT DEFAULT 0,
                 referrer_id BIGINT DEFAULT NULL,
                 rubles INT DEFAULT 0,
@@ -69,22 +70,31 @@ def init_db():
                 date TEXT PRIMARY KEY,
                 awarded INT DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS giveaways (
+                id SERIAL PRIMARY KEY,
+                amount BIGINT,
+                currency TEXT,
+                description TEXT,
+                message_id BIGINT,
+                is_active INT DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS giveaway_participants (
+                giveaway_id INT,
+                user_id BIGINT,
+                PRIMARY KEY (giveaway_id, user_id)
+            );
         """)
-        cursor.execute("""
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS balance BIGINT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS warns INT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS links_today INT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_link_date TEXT;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked INT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deputy INT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_frozen INT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id BIGINT DEFAULT NULL;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS rubles INT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS rubles_total INT DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-        """)
+        # Миграция колонок
+        columns = [
+            ("atoms", "BIGINT DEFAULT 0"),
+            ("rank_level", "INT DEFAULT 0"),
+            ("is_frozen", "INT DEFAULT 0"),
+            ("referrer_id", "BIGINT DEFAULT NULL"),
+            ("rubles", "INT DEFAULT 0"),
+            ("rubles_total", "INT DEFAULT 0")
+        ]
+        for col, col_type in columns:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {col_type};")
     else:
         cursor.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -92,11 +102,12 @@ def init_db():
                 username TEXT,
                 first_name TEXT,
                 balance INTEGER DEFAULT 0,
+                atoms INTEGER DEFAULT 0,
                 warns INTEGER DEFAULT 0,
                 links_today INTEGER DEFAULT 0,
                 last_link_date TEXT,
                 is_blocked INTEGER DEFAULT 0,
-                is_deputy INTEGER DEFAULT 0,
+                rank_level INTEGER DEFAULT 0,
                 is_frozen INTEGER DEFAULT 0,
                 referrer_id INTEGER DEFAULT NULL,
                 rubles INTEGER DEFAULT 0,
@@ -133,8 +144,21 @@ def init_db():
                 date TEXT PRIMARY KEY,
                 awarded INTEGER DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS giveaways (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                amount INTEGER,
+                currency TEXT,
+                description TEXT,
+                message_id INTEGER,
+                is_active INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS giveaway_participants (
+                giveaway_id INTEGER,
+                user_id INTEGER,
+                PRIMARY KEY (giveaway_id, user_id)
+            );
         """)
-        for col in ["is_deputy INTEGER DEFAULT 0", "is_frozen INTEGER DEFAULT 0", "referrer_id INTEGER DEFAULT NULL", "rubles INTEGER DEFAULT 0", "rubles_total INTEGER DEFAULT 0"]:
+        for col in ["atoms INTEGER DEFAULT 0", "rank_level INTEGER DEFAULT 0", "is_frozen INTEGER DEFAULT 0", "referrer_id INTEGER DEFAULT NULL", "rubles INTEGER DEFAULT 0", "rubles_total INTEGER DEFAULT 0"]:
             try:
                 cursor.execute(f"ALTER TABLE users ADD COLUMN {col};")
             except Exception:
@@ -145,22 +169,25 @@ def init_db():
 def get_user(user_id: int, username: str = "", first_name: str = ""):
     conn, mode = get_db()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) if mode == "pg" else conn.cursor()
+    safe_uname = username or ""
+    safe_fname = first_name or "Участник"
+
     cursor.execute("SELECT * FROM users WHERE user_id = %s" if mode == "pg" else "SELECT * FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     if not user:
-        q = "INSERT INTO users (user_id, username, first_name, balance, joined_at) VALUES (%s, %s, %s, 0, %s)" if mode == "pg" else \
-            "INSERT INTO users (user_id, username, first_name, balance, joined_at) VALUES (?, ?, ?, 0, ?)"
-        cursor.execute(q, (user_id, username, first_name, now_str))
+        q = "INSERT INTO users (user_id, username, first_name, balance, atoms, joined_at) VALUES (%s, %s, %s, 0, 0, %s)" if mode == "pg" else \
+            "INSERT INTO users (user_id, username, first_name, balance, atoms, joined_at) VALUES (?, ?, ?, 0, 0, ?)"
+        cursor.execute(q, (user_id, safe_uname, safe_fname, now_str))
         if mode == "sqlite": conn.commit()
         cursor.execute("SELECT * FROM users WHERE user_id = %s" if mode == "pg" else "SELECT * FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
     else:
-        if username or first_name:
+        if safe_uname or safe_fname:
             q = "UPDATE users SET username = %s, first_name = %s WHERE user_id = %s" if mode == "pg" else \
                 "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?"
-            cursor.execute(q, (username or user["username"], first_name or user["first_name"], user_id))
+            cursor.execute(q, (safe_uname or user["username"], safe_fname or user["first_name"], user_id))
             if mode == "sqlite": conn.commit()
 
     res = dict(user)
@@ -176,12 +203,21 @@ def set_referrer(user_id: int, referrer_id: int):
     if mode == "sqlite": conn.commit()
     conn.close()
 
-def reward_referrer(referrer_id: int, rubles: int = 10):
+def reward_referrer(referrer_id: int, rubles: int = 10, atoms: int = 5):
     conn, mode = get_db()
     cursor = conn.cursor()
-    q = "UPDATE users SET rubles = rubles + %s, rubles_total = rubles_total + %s WHERE user_id = %s" if mode == "pg" else \
-        "UPDATE users SET rubles = rubles + ?, rubles_total = rubles_total + ? WHERE user_id = ?"
-    cursor.execute(q, (rubles, rubles, referrer_id))
+    q = "UPDATE users SET rubles = rubles + %s, rubles_total = rubles_total + %s, atoms = atoms + %s WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET rubles = rubles + ?, rubles_total = rubles_total + ?, atoms = atoms + ? WHERE user_id = ?"
+    cursor.execute(q, (rubles, rubles, atoms, referrer_id))
+    if mode == "sqlite": conn.commit()
+    conn.close()
+
+def penalize_referrer(referrer_id: int, rubles: int = 10, atoms: int = 5):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE users SET rubles = rubles - %s, atoms = atoms - %s WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET rubles = rubles - ?, atoms = atoms - ? WHERE user_id = ?"
+    cursor.execute(q, (rubles, atoms, referrer_id))
     if mode == "sqlite": conn.commit()
     conn.close()
 
@@ -194,14 +230,18 @@ def get_referrals_count(user_id: int) -> int:
     conn.close()
     return count
 
-def set_deputy(user_id: int, status: int = 1):
+def promote_rank(user_id: int) -> int:
+    u = get_user(user_id)
+    current_rank = u.get("rank_level") or 0
+    new_rank = 1 if current_rank == 0 else 2
     conn, mode = get_db()
     cursor = conn.cursor()
-    q = "UPDATE users SET is_deputy = %s, is_frozen = 0 WHERE user_id = %s" if mode == "pg" else \
-        "UPDATE users SET is_deputy = ?, is_frozen = 0 WHERE user_id = ?"
-    cursor.execute(q, (status, user_id))
+    q = "UPDATE users SET rank_level = %s, is_frozen = 0 WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET rank_level = ?, is_frozen = 0 WHERE user_id = ?"
+    cursor.execute(q, (new_rank, user_id))
     if mode == "sqlite": conn.commit()
     conn.close()
+    return new_rank
 
 def set_frozen(user_id: int, status: int = 1):
     conn, mode = get_db()
@@ -209,6 +249,15 @@ def set_frozen(user_id: int, status: int = 1):
     q = "UPDATE users SET is_frozen = %s WHERE user_id = %s" if mode == "pg" else \
         "UPDATE users SET is_frozen = ? WHERE user_id = ?"
     cursor.execute(q, (status, user_id))
+    if mode == "sqlite": conn.commit()
+    conn.close()
+
+def demote_rank(user_id: int):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE users SET rank_level = 0, is_frozen = 0 WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET rank_level = 0, is_frozen = 0 WHERE user_id = ?"
+    cursor.execute(q, (user_id,))
     if mode == "sqlite": conn.commit()
     conn.close()
 
@@ -224,6 +273,19 @@ def update_balance(user_id: int, amount: int) -> int:
     if mode == "sqlite": conn.commit()
     conn.close()
     return new_bal
+
+def update_atoms(user_id: int, amount: int) -> int:
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE users SET atoms = atoms + %s WHERE user_id = %s" if mode == "pg" else \
+        "UPDATE users SET atoms = atoms + ? WHERE user_id = ?"
+    cursor.execute(q, (amount, user_id))
+    q_sel = "SELECT atoms FROM users WHERE user_id = %s" if mode == "pg" else "SELECT atoms FROM users WHERE user_id = ?"
+    cursor.execute(q_sel, (user_id,))
+    new_atoms = cursor.fetchone()[0]
+    if mode == "sqlite": conn.commit()
+    conn.close()
+    return new_atoms
 
 def check_and_increment_links(user_id: int) -> int:
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -423,6 +485,70 @@ def mark_reward_given(date_str: str):
     else:
         cursor.execute("INSERT OR REPLACE INTO reward_history (date, awarded) VALUES (?, 1)", (date_str,))
         conn.commit()
+    conn.close()
+
+# --- МЕХАНИКА РОЗЫГРЫШЕЙ ---
+def create_giveaway(amount: int, currency: str, description: str, message_id: int) -> int:
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    if mode == "pg":
+        cursor.execute("INSERT INTO giveaways (amount, currency, description, message_id, is_active) VALUES (%s, %s, %s, %s, 1) RETURNING id", (amount, currency, description, message_id))
+        gid = cursor.fetchone()[0]
+    else:
+        cursor.execute("INSERT INTO giveaways (amount, currency, description, message_id, is_active) VALUES (?, ?, ?, ?, 1)", (amount, currency, description, message_id))
+        conn.commit()
+        gid = cursor.lastrowid
+    conn.close()
+    return gid
+
+def get_active_giveaway():
+    conn, mode = get_db()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) if mode == "pg" else conn.cursor()
+    q = "SELECT * FROM giveaways WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
+    cursor.execute(q)
+    res = cursor.fetchone()
+    conn.close()
+    return dict(res) if res else None
+
+def add_giveaway_participant(giveaway_id: int, user_id: int) -> bool:
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    try:
+        if mode == "pg":
+            cursor.execute("INSERT INTO giveaway_participants (giveaway_id, user_id) VALUES (%s, %s)", (giveaway_id, user_id))
+        else:
+            cursor.execute("INSERT INTO giveaway_participants (giveaway_id, user_id) VALUES (?, ?)", (giveaway_id, user_id))
+            conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        conn.close()
+        return False
+
+def get_giveaway_participants_count(giveaway_id: int) -> int:
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "SELECT COUNT(*) FROM giveaway_participants WHERE giveaway_id = %s" if mode == "pg" else "SELECT COUNT(*) FROM giveaway_participants WHERE giveaway_id = ?"
+    cursor.execute(q, (giveaway_id,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+def get_giveaway_participants(giveaway_id: int):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "SELECT user_id FROM giveaway_participants WHERE giveaway_id = %s" if mode == "pg" else "SELECT user_id FROM giveaway_participants WHERE giveaway_id = ?"
+    cursor.execute(q, (giveaway_id,))
+    rows = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def finish_giveaway(giveaway_id: int):
+    conn, mode = get_db()
+    cursor = conn.cursor()
+    q = "UPDATE giveaways SET is_active = 0 WHERE id = %s" if mode == "pg" else "UPDATE giveaways SET is_active = 0 WHERE id = ?"
+    cursor.execute(q, (giveaway_id,))
+    if mode == "sqlite": conn.commit()
     conn.close()
 
 init_db()
