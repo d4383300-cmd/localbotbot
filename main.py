@@ -43,6 +43,12 @@ active_proposals = {}
 active_jobs = {}
 deputy_punishments = {}
 
+# Анти-спам для ивента: { user_id: [timestamp1, timestamp2, ...] }
+event_user_messages = {}
+
+# Активный ивент: { "active": bool, "reward": int, "type": "football"|"basketball", "target": int, "scores": { user_id: count }, "message_id": int }
+active_event = None
+
 class Registration(StatesGroup):
     name = State()
     age = State()
@@ -72,7 +78,7 @@ def can_moderate(user_id: int) -> bool:
     if user_id == LEYMIK_ID or is_admin(user_id):
         return True
     u = db.get_user(user_id)
-    if u.get("is_deputy") == 1 and u.get("is_frozen", 0) == 0:
+    if (u.get("rank_level") or 0) >= 1 and u.get("is_frozen", 0) == 0:
         return True
     return False
 
@@ -92,13 +98,11 @@ def format_duration(start_dt: datetime) -> str:
 
 # --- Защита от краша чата (Leymik защищен от заморозки) ---
 async def check_deputy_limits(user_id: int, first_name: str) -> bool:
-    if user_id == LEYMIK_ID:
-        return True # Иммунитет создателя
-    if is_admin(user_id):
+    if user_id == LEYMIK_ID or is_admin(user_id):
         return True
 
     u = db.get_user(user_id)
-    if u.get("is_deputy") != 1:
+    if (u.get("rank_level") or 0) < 1:
         return True
 
     now = time.time()
@@ -122,7 +126,7 @@ async def check_deputy_limits(user_id: int, first_name: str) -> bool:
             TARGET_CHAT_ID,
             f"🚨 <b>ТРЕВОГА АНТИ-КРАШ СИСТЕМЫ!</b> 🚨\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <b>Суженый Служенный <a href='tg://user?id={user_id}'>{first_name}</a></b> произвёл 3 наказания за 5 минут!\n\n"
+            f"⚠️ <b>Модератор <a href='tg://user?id={user_id}'>{first_name}</a></b> произвёл 3 наказания за 5 минут!\n\n"
             f"❄️ <b>Его ранг и права АВТОМАТИЧЕСКИ ЗАМОРОЖЕНЫ!</b>\n"
             f"Доступ к модерации заблокирован.\n\n"
             f"👑 @Leymik, судьба модератора в ваших руках:",
@@ -132,7 +136,7 @@ async def check_deputy_limits(user_id: int, first_name: str) -> bool:
         return False
     return True
 
-# --- АВТОМАТИЧЕСКОЕ ОДОБРЕНИЕ ЗАЯВОК НА ВСТУПЛЕНИЕ ---
+# --- АВТОМАТИЧЕСКОЕ ОДОБРЕНИЕ ЗАЯВОК ---
 @dp.chat_join_request(F.chat.id == TARGET_CHAT_ID)
 async def auto_approve_join(update: types.ChatJoinRequest):
     try:
@@ -149,7 +153,25 @@ async def auto_approve_join(update: types.ChatJoinRequest):
     except Exception as e:
         print(f"Ошибка автоодобрения заявки: {e}")
 
-# --- Статус бота и приветствие ---
+# --- ВЫХОД ИЗ ЧАТА (ШТРАФ РЕФЕРЕРУ) ---
+@dp.message(F.chat.id == TARGET_CHAT_ID, F.left_chat_member)
+async def handle_left_chat_member(message: types.Message):
+    left_user = message.left_chat_member
+    u_info = db.get_user(left_user.id)
+    ref_id = u_info.get("referrer_id")
+    if ref_id:
+        db.penalize_referrer(ref_id, rubles=10, atoms=5)
+        try:
+            await bot.send_message(
+                ref_id,
+                f"⚠️ <b>Штраф за выход реферала!</b>\n"
+                f"Пользователь <a href='tg://user?id={left_user.id}'>{left_user.first_name}</a> покинул чат.\n"
+                f"📉 С вашего баланса списано: <b>-10 рублей</b> и <b>-5 атомов</b>.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
 @dp.my_chat_member()
 async def bot_rights_updated(event: types.ChatMemberUpdated):
     if event.chat.id == TARGET_CHAT_ID and event.new_chat_member.status == ChatMemberStatus.ADMINISTRATOR:
@@ -172,7 +194,7 @@ async def welcome_members(message: types.Message):
             parse_mode=ParseMode.HTML
         )
 
-# --- НОВОЕ ГЛАВНОЕ МЕНЮ В ЛС: /start ---
+# --- ГЛАВНОЕ МЕНЮ В ЛС: /start ---
 @dp.message(F.chat.type == "private", CommandStart())
 async def start_cmd(message: types.Message, command: CommandObject):
     user_id = message.from_user.id
@@ -181,7 +203,6 @@ async def start_cmd(message: types.Message, command: CommandObject):
 
     db.get_user(user_id, message.from_user.username or "", message.from_user.first_name)
 
-    # Привязка реферала, если перешли по ссылке вида /start ref_12345
     if command.args and command.args.startswith("ref_"):
         try:
             ref_id = int(command.args.split("_")[1])
@@ -201,7 +222,7 @@ async def start_cmd(message: types.Message, command: CommandObject):
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Выбери нужный раздел с помощью кнопок ниже:\n\n"
         f"• <b>Кинуть заявку в чат</b> — заполнить анкету на вступление.\n"
-        f"• <b>Заработок</b> — реферальная система и вывод реальных рублей.\n"
+        f"• <b>Заработок</b> — реферальная система (рубли и атомы).\n"
         f"• <b>Профиль</b> — твой баланс и статистика заработка.\n"
         f"━━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=kb,
@@ -229,10 +250,11 @@ async def handle_menu_earn(cb: types.CallbackQuery):
         f"🔗 <b>Твоя персональная ссылка:</b>\n"
         f"<code>{ref_link}</code>\n\n"
         f"📖 <b>Инструкция:</b>\n"
-        f"1. Отправь ссылку своим друзьям и знакомым.\n"
-        f"2. Они переходят по ссылке и подают заявку в чат.\n"
-        f"3. При одобрении заявки и входе друга в чат тебе начисляется <b>10 рублей</b>!\n\n"
-        f"💳 <b>Минимальный вывод:</b> от <b>250 рублей</b>.\n"
+        f"1. Отправь ссылку друзьям.\n"
+        f"2. Они подают заявку и заходят в чат.\n"
+        f"3. При одобрении ты получаешь <b>10 рублей</b> и <b>5 атомов 💎</b>!\n"
+        f"⚠️ <b>Внимание:</b> если приглашённый выйдет из чата — будет штраф <b>-10 ₽</b> и <b>-5 атомов</b>!\n\n"
+        f"💳 <b>Вывод средств:</b> от <b>250 рублей</b>.\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     await cb.message.answer(text, parse_mode=ParseMode.HTML)
@@ -246,11 +268,13 @@ async def handle_menu_profile(cb: types.CallbackQuery):
 
     rubles = u_data.get("rubles", 0)
     rubles_total = u_data.get("rubles_total", 0)
+    atoms = u_data.get("atoms", 0)
 
     text = (
         f"👤 <b>ЛИЧНЫЙ ПРОФИЛЬ ЗАРАБОТКА</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>Доступно к выводу:</b> {rubles} ₽\n"
+        f"💎 <b>Баланс атомов:</b> {atoms} ⚛️\n"
         f"📊 <b>Заработано за всё время:</b> {rubles_total} ₽\n"
         f"👥 <b>Приглашено друзей:</b> {ref_count} чел.\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -262,7 +286,7 @@ async def handle_menu_profile(cb: types.CallbackQuery):
         kb_list.append([InlineKeyboardButton(text="💬 Написать @Leymik для вывода", url="https://t.me/Leymik")])
     else:
         rem = 250 - rubles
-        text += f"ℹ️ До минимального вывода осталось накопить: <b>{rem} ₽</b> (пригласите ещё {max(1, (rem + 9) // 10)} друзей)."
+        text += f"ℹ️ До минимального вывода осталось накопить: <b>{rem} ₽</b>."
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_list) if kb_list else None
     await cb.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -281,8 +305,7 @@ async def process_age(message: types.Message, state: FSMContext):
     if db.is_blocked(message.from_user.id): return
     try:
         age = int(message.text)
-        if age < 10 or age > 99:
-            raise ValueError
+        if age < 10 or age > 99: raise ValueError
     except ValueError:
         return await message.answer("⚠️ Пожалуйста, укажи реальный возраст числом!")
 
@@ -380,15 +403,14 @@ async def process_admin_decision(cb: types.CallbackQuery):
         except Exception:
             pass
 
-        # Начисление 10 рублей рефереру, если кандидат пришел по ссылке
         u_info = db.get_user(target_id)
         if u_info.get("referrer_id"):
-            db.reward_referrer(u_info["referrer_id"], 10)
+            db.reward_referrer(u_info["referrer_id"], rubles=10, atoms=5)
             try:
                 await bot.send_message(
                     u_info["referrer_id"],
                     f"🎉 <b>Ваш приглашенный друг был принят в Localhaus!</b>\n"
-                    f"💰 Вам начислено <b>+10 рублей</b> на баланс профиля.",
+                    f"💰 Вам начислено <b>+10 рублей</b> и <b>+5 атомов 💎</b> на баланс.",
                     parse_mode=ParseMode.HTML
                 )
             except Exception:
@@ -416,7 +438,7 @@ async def process_admin_decision(cb: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("deputy_"))
 async def process_deputy_freeze_cb(cb: types.CallbackQuery):
     if cb.from_user.id != LEYMIK_ID:
-        return await cb.answer("⛔ Только @Leymik принимает решения по Суженому!", show_alert=True)
+        return await cb.answer("⛔ Только @Leymik принимает решения по модераторам!", show_alert=True)
 
     parts = cb.data.split("_")
     sub_action = parts[1]
@@ -429,18 +451,94 @@ async def process_deputy_freeze_cb(cb: types.CallbackQuery):
         await cb.message.edit_text(
             f"☀️ <b>РАЗМОРОЗКА!</b>\n\n"
             f"👑 @Leymik снял заморозку с <b><a href='tg://user?id={target_id}'>{target['first_name']}</a></b>.\n"
-            f"Ранг <b>Суженый Служенный</b> восстановлен в полном объеме.",
+            f"Полномочия восстановлены.",
             parse_mode=ParseMode.HTML
         )
     elif sub_action == "demote":
-        db.set_deputy(target_id, 0)
-        db.set_frozen(target_id, 0)
+        db.demote_rank(target_id)
         deputy_punishments.pop(target_id, None)
         await cb.message.edit_text(
             f"🚫 <b>РАНГ АННУЛИРОВАН!</b>\n\n"
-            f"👑 @Leymik снял звание Суженого с <b><a href='tg://user?id={target_id}'>{target['first_name']}</a></b>.",
+            f"👑 @Leymik снял звание с <b><a href='tg://user?id={target_id}'>{target['first_name']}</a></b>.",
             parse_mode=ParseMode.HTML
         )
+    await cb.answer()
+
+# --- КНОПКИ РОЗЫГРЫША ---
+@dp.callback_query(F.data.startswith("giveaway_join_"))
+async def handle_giveaway_join(cb: types.CallbackQuery):
+    gid = int(cb.data.split("_")[2])
+    user_id = cb.from_user.id
+    db.get_user(user_id, cb.from_user.username or "", cb.from_user.first_name)
+
+    success = db.add_giveaway_participant(gid, user_id)
+    if not success:
+        return await cb.answer("⚠️ Вы уже участвуете в этом розыгрыше!", show_alert=True)
+
+    count = db.get_giveaway_participants_count(gid)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🎉 Принять участие ({count})", callback_data=f"giveaway_join_{gid}")]
+    ])
+    try:
+        await cb.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+    await cb.answer("✅ Вы успешно зарегистрированы в розыгрыше!")
+
+@dp.callback_query(F.data.startswith("giveaway_end_"))
+async def handle_giveaway_end(cb: types.CallbackQuery):
+    if cb.from_user.id != LEYMIK_ID:
+        return await cb.answer("⛔ Только @Leymik может завершить розыгрыш!", show_alert=True)
+
+    gid = int(cb.data.split("_")[2])
+    g_info = db.get_active_giveaway()
+    if not g_info or g_info["id"] != gid:
+        return await cb.answer("Этот розыгрыш уже завершен.")
+
+    participants = db.get_giveaway_participants(gid)
+    db.finish_giveaway(gid)
+
+    # Снятие старого закрепа
+    try:
+        await bot.unpin_chat_message(TARGET_CHAT_ID, g_info["message_id"])
+    except Exception:
+        pass
+
+    curr_icon = "⚛️ атомов" if g_info["currency"] == "атомы" else "🍁 листочек"
+
+    if not participants:
+        res_msg = await bot.send_message(
+            TARGET_CHAT_ID,
+            f"🏁 <b>РОЗЫГРЫШ ЗАВЕРШЁН</b> 🏁\n\n"
+            f"К сожалению, никто не принял участие в раздаче <b>{g_info['amount']} {curr_icon}</b>.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        winner_id = random.choice(participants)
+        winner = db.get_user(winner_id)
+        if g_info["currency"] == "атомы":
+            db.update_atoms(winner_id, g_info["amount"])
+        else:
+            db.update_balance(winner_id, g_info["amount"])
+
+        res_msg = await bot.send_message(
+            TARGET_CHAT_ID,
+            f"🎊 <b>ИТОГИ РОЗЫГРЫША!</b> 🎊\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎁 <b>Приз:</b> <b>{g_info['amount']} {curr_icon}</b>\n"
+            f"📝 <b>Описание:</b> {g_info['description']}\n\n"
+            f"👑 <b>Счастливый победитель:</b>\n"
+            f"👉 <b><a href='tg://user?id={winner_id}'>{winner['first_name']}</a></b> (@{winner.get('username') or 'нет'})\n\n"
+            f"💰 Приз успешно зачислен на баланс победителя! Поздравляем! 🎉\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML
+        )
+        try:
+            await bot.pin_chat_message(TARGET_CHAT_ID, res_msg.message_id)
+        except Exception:
+            pass
+
+    await cb.message.edit_text(f"✅ Розыгрыш #{gid} успешно завершен, итоги подведены и закреплены в чате!")
     await cb.answer()
 
 # --- CALLBACKS: БРАК И ПЛАТНЫЕ РП ---
@@ -518,48 +616,18 @@ async def process_paid_rp(cb: types.CallbackQuery):
 # --- ОБРАБОТЧИК СООБЩЕНИЙ ЧАТА ---
 @dp.message(F.chat.id == TARGET_CHAT_ID)
 async def handle_chat_message(message: types.Message):
-    global last_admin_fetch
+    global last_admin_fetch, active_event
     user_id = message.from_user.id
     text = message.text or message.caption or ""
     lower_text = text.lower().strip()
 
-    # --- КАЗИНО: СЛОТ 🎰 ---
-    if message.dice and message.dice.emoji == "🎰":
-        is_forwarded = bool(
-            message.forward_date or message.forward_from or 
-            message.forward_from_chat or getattr(message, 'forward_origin', None)
-        )
-        if is_forwarded: return
-
-        dice_val = message.dice.value
-        if dice_val == 64:
-            new_bal = db.update_balance(user_id, 100)
-            return await message.reply(
-                f"🎰🔥 <b>ДЖЕКПОТ! ТРИ СЕМЁРКИ (777)!</b> 🔥🎰\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎉 <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> выбивает золотые три семерки!\n"
-                f"💰 <b>Выигрыш: +100</b> 🍁 листочек!\n"
-                f"🍃 Текущий кошелек: <b>{new_bal}</b> 🍁\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━",
-                parse_mode=ParseMode.HTML
-            )
-        elif dice_val in [1, 22, 43]:
-            new_bal = db.update_balance(user_id, 30)
-            return await message.reply(
-                f"🎰✨ <b>ТРИ В РЯД!</b> ✨🎰\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 Линия совпала! <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> забирает выигрыш за комбинацию!\n"
-                f"💰 <b>Выигрыш: +30</b> 🍁 листочек!\n"
-                f"🍃 Текущий кошелек: <b>{new_bal}</b> 🍁\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━",
-                parse_mode=ParseMode.HTML
-            )
-        return
-
-    # Запись активности
-    msk_today = get_msk_today_str()
+    # Гарантированная регистрация пользователя
     sender_data = db.get_user(user_id, message.from_user.username or "", message.from_user.first_name)
+    msk_today = get_msk_today_str()
     db.record_message(user_id, msk_today)
+
+    if message.from_user.username:
+        db.save_member(user_id, message.from_user.username)
 
     if time.time() - last_admin_fetch > 600:
         await refresh_admin_cache()
@@ -567,10 +635,112 @@ async def handle_chat_message(message: types.Message):
     user_admin = is_admin(user_id)
     user_can_mod = can_moderate(user_id)
 
-    if message.from_user.username:
-        db.save_member(user_id, message.from_user.username)
+    # --- ОБРАБОТКА ДАЙСОВ (ИВЕНТ ИЛИ КАЗИНО 777) ---
+    if message.dice:
+        is_forwarded = bool(
+            message.forward_date or message.forward_from or 
+            message.forward_from_chat or getattr(message, 'forward_origin', None)
+        )
+        if is_forwarded: return # Защита от пересылок
 
-    # Проверка ответа на математический пример
+        # 1. Проверка участия в активном Ивенте Футбол/Баскетбол
+        if active_event and active_event.get("active"):
+            req_emoji = "⚽" if active_event["type"] == "football" else "🏀"
+            if message.dice.emoji == req_emoji:
+                now = time.time()
+                e_history = event_user_messages.get(user_id, [])
+                e_history = [t for t in e_history if now - t < 5]
+                e_history.append(now)
+                event_user_messages[user_id] = e_history
+
+                # Анти-спам: больше 5 за 5 сек -> мут на 1 минуту
+                if len(e_history) > 5:
+                    event_user_messages.pop(user_id, None)
+                    try:
+                        await message.delete()
+                        until = datetime.utcnow() + timedelta(minutes=1)
+                        await bot.restrict_chat_member(
+                            TARGET_CHAT_ID,
+                            user_id,
+                            permissions=ChatPermissions(can_send_messages=False),
+                            until_date=until
+                        )
+                        return await message.answer(
+                            f"🔇 <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> получает мут на 1 минуту за спам в ивенте (>5 бросков за 5 сек)!",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+
+                # Гол в футболе: значения 3, 4, 5
+                # Попадание в баскетболе: значения 4, 5
+                is_goal = (req_emoji == "⚽" and message.dice.value in [3, 4, 5]) or \
+                          (req_emoji == "🏀" and message.dice.value in [4, 5])
+
+                if is_goal:
+                    current_goals = active_event["scores"].get(user_id, 0) + 1
+                    active_event["scores"][user_id] = current_goals
+                    remaining = active_event["target"] - current_goals
+
+                    if remaining <= 0:
+                        reward = active_event["reward"]
+                        new_bal = db.update_balance(user_id, reward)
+                        winner_name = message.from_user.first_name
+                        active_event["active"] = False
+
+                        try:
+                            await bot.unpin_chat_message(TARGET_CHAT_ID, active_event["message_id"])
+                        except Exception:
+                            pass
+
+                        active_event = None
+                        return await message.reply(
+                            f"🏆 <b>ИВЕНТ ЗАВЕРШЁН! ПОБЕДИТЕЛЬ ОПРЕДЕЛЁН!</b> 🏆\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🎉 <b><a href='tg://user?id={user_id}'>{winner_name}</a></b> первым забил необходимое количество голов/попаданий!\n"
+                            f"💰 <b>Награда: +{reward} 🍁 листочек</b> зачислена на баланс!\n"
+                            f"🍃 Баланс победителя: <b>{new_bal}</b> 🍁\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━",
+                            parse_mode=ParseMode.HTML
+                        )
+                    else:
+                        target_text = "в ворота" if req_emoji == "⚽" else "в кольцо"
+                        return await message.reply(
+                            f"🎯 <b>ТОЧНОЕ ПОПАДАНИЕ!</b> ({current_goals}/{active_event['target']})\n"
+                            f"👤 Игрок: <b><a href='tg://user?id={user_id}'>{message.from_user.first_name}</a></b>\n"
+                            f"⚽ Осталось забить {target_text}: <b>{remaining}</b> раз(а)!",
+                            parse_mode=ParseMode.HTML
+                        )
+                return
+
+        # 2. Обычный слот казино
+        if message.dice.emoji == "🎰":
+            dice_val = message.dice.value
+            if dice_val == 64:
+                new_bal = db.update_balance(user_id, 100)
+                return await message.reply(
+                    f"🎰🔥 <b>ДЖЕКПОТ! ТРИ СЕМЁРКИ (777)!</b> 🔥🎰\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎉 <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> выбивает золотые три семерки!\n"
+                    f"💰 <b>Выигрыш: +100</b> 🍁 листочек!\n"
+                    f"🍃 Текущий кошелек: <b>{new_bal}</b> 🍁\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━",
+                    parse_mode=ParseMode.HTML
+                )
+            elif dice_val in [1, 22, 43]:
+                new_bal = db.update_balance(user_id, 30)
+                return await message.reply(
+                    f"🎰✨ <b>ТРИ В РЯД!</b> ✨🎰\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎯 Линия совпала! <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> забирает выигрыш за комбинацию!\n"
+                    f"💰 <b>Выигрыш: +30</b> 🍁 листочек!\n"
+                    f"🍃 Текущий кошелек: <b>{new_bal}</b> 🍁\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━",
+                    parse_mode=ParseMode.HTML
+                )
+            return
+
+    # Проверка ответа на математический пример работы
     if message.reply_to_message and message.reply_to_message.message_id in active_jobs:
         job = active_jobs[message.reply_to_message.message_id]
         if job["user_id"] != user_id:
@@ -691,22 +861,118 @@ async def handle_chat_message(message: types.Message):
                 parse_mode=ParseMode.HTML
             )
 
-    # --- 👑 КОМАНДЫ ТОЛЬКО ДЛЯ LEYMIK ---
+    # --- КОМАНДА ДЛЯ ВИЛОЧНИКА: "ВИЛКИ" ---
+    if lower_text == "вилки":
+        rank = sender_data.get("rank_level") or 0
+        if rank >= 2 or user_id == LEYMIK_ID:
+            return await message.reply("Вилки")
+
+    # --- 👑 КОМАНДЫ ТОЛЬКО ДЛЯ СОЗДАТЕЛЯ @LEYMIK ---
     if user_id == LEYMIK_ID:
+        # Ивент: ивент (выигрыш) (баскетбол/футбол) (цель)
+        event_match = re.match(r"^ивент\s+(\d+)\s+(баскетбол|футбол)\s+(\d+)$", lower_text)
+        if event_match:
+            reward = int(event_match.group(1))
+            e_type = event_match.group(2)
+            target_score = int(event_match.group(3))
+
+            emoji = "⚽" if e_type == "футбол" else "🏀"
+            action_desc = "в ворота" if e_type == "футбол" else "в кольцо"
+
+            event_msg = await message.answer(
+                f"🔥 <b>СТАРТОВАЛ ИВЕНТ: {e_type.upper()}!</b> 🔥\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 <b>Приз победителю:</b> <b>{reward} 🍁 листочек</b>\n"
+                f"🎯 <b>Цель:</b> первым забить <b>{target_score}</b> раз(а) {action_desc}!\n\n"
+                f"📖 <b>Инструкция:</b>\n"
+                f"Отправляйте в чат эмодзи {emoji} без текста и без пересылок!\n"
+                f"⚠️ <b>Правило честной игры:</b> не более 5 сообщений за 5 секунд, иначе мут на 1 минуту!\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                await bot.pin_chat_message(TARGET_CHAT_ID, event_msg.message_id)
+            except Exception:
+                pass
+
+            active_event = {
+                "active": True,
+                "reward": reward,
+                "type": e_type,
+                "target": target_score,
+                "scores": {},
+                "message_id": event_msg.message_id
+            }
+            return
+
+        # Раздача / Розыгрыш: раздача (число) (атомы/листочки) (описание)
+        giveaway_match = re.match(r"^раздача\s+(\d+)\s+(атомы|листочки)\s+(.+)$", lower_text)
+        if giveaway_match:
+            amount = int(giveaway_match.group(1))
+            currency = giveaway_match.group(2)
+            desc = giveaway_match.group(3)
+
+            curr_icon = "⚛️ атомов" if currency == "атомы" else "🍁 листочек"
+
+            kb_group = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎉 Принять участие (0)", callback_data="giveaway_join_temp")]
+            ])
+
+            post = await message.answer(
+                f"🎁 <b>НАЧАЛАСЬ РАЗДАЧА: {amount} {curr_icon.upper()}!</b> 🎁\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📝 <b>Описание:</b> {desc}\n\n"
+                f"👇 Нажмите кнопку ниже, чтобы принять участие в розыгрыше!\n"
+                f"Победитель определится решением создателя @Leymik.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━",
+                reply_markup=kb_group,
+                parse_mode=ParseMode.HTML
+            )
+            gid = db.create_giveaway(amount, currency, desc, post.message_id)
+            # Обновляем callback с ID раздачи
+            kb_group_updated = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎉 Принять участие (0)", callback_data=f"giveaway_join_{gid}")]
+            ])
+            await post.edit_reply_markup(reply_markup=kb_group_updated)
+
+            try:
+                await bot.pin_chat_message(TARGET_CHAT_ID, post.message_id)
+            except Exception:
+                pass
+
+            kb_admin = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏁 Закончить и выбрать победителя", callback_data=f"giveaway_end_{gid}")]
+            ])
+
+            chat_link = f"https://t.me/c/{str(TARGET_CHAT_ID).replace('-100', '')}/{post.message_id}"
+            try:
+                await bot.send_message(
+                    LEYMIK_ID,
+                    f"📢 <b>Розыгрыш #{gid} запущен!</b>\n"
+                    f"🔗 <a href='{chat_link}'>Ссылка на розыгрыш</a>\n"
+                    f"Приз: <b>{amount} {curr_icon}</b>\n\n"
+                    f"Нажмите кнопку ниже, чтобы завершить розыгрыш и объявить итоги:",
+                    reply_markup=kb_admin,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+            return
+
         # Разморозить
         if lower_text == "разморозить":
             if not message.reply_to_message:
-                return await message.reply("⚠️ Ответь этой командой на сообщение Суженого!")
+                return await message.reply("⚠️ Ответь этой командой на сообщение модератора!")
             target = message.reply_to_message.from_user
             db.set_frozen(target.id, 0)
             deputy_punishments.pop(target.id, None)
             return await message.reply(
                 f"☀️ <b>РАЗМОРОЗКА!</b>\n"
-                f"👑 @Leymik разморозил ранг <a href='tg://user?id={target.id}'>{target.first_name}</a>. Полномочия восстановлены!",
+                f"👑 @Leymik разморозил полномочия <a href='tg://user?id={target.id}'>{target.first_name}</a>!",
                 parse_mode=ParseMode.HTML
             )
 
-        # Повысить
+        # Повысить: 1-й раз -> Суженый, 2-й раз -> Вилочник
         if lower_text == "повысить":
             if not message.reply_to_message:
                 return await message.reply("⚠️ Ответь этой командой на сообщение того, кого хочешь повысить!")
@@ -714,14 +980,17 @@ async def handle_chat_message(message: types.Message):
             if target.id == LEYMIK_ID or target.id == bot.id:
                 return await message.reply("😅 Этого пользователя нельзя повысить.")
 
-            db.set_deputy(target.id, 1)
+            new_rank = db.promote_rank(target.id)
+            rank_name = "«Суженый Служенный»" if new_rank == 1 else "«Вилочник» 🍴"
+            desc_extra = "\n🍴 <i>Доступна эксклюзивная команда \"вилки\"!</i>" if new_rank == 2 else ""
+
             return await message.reply(
                 f"⚜️ <b>ПОВЫШЕНИЕ В РАНГЕ!</b> ⚜️\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👑 @Leymik назначает <a href='tg://user?id={target.id}'>{target.first_name}</a> на должность:\n"
-                f"🎖 <b>«Суженый Служенный»</b>\n\n"
-                f"🛡 <b>Полномочия:</b> Бан, Кик, Мут, Размут.\n"
-                f"⚠️ <i>При попытке слить чат (3 наказания за 5 минут) ранг будет автоматически заморожен!</i>\n"
+                f"👑 @Leymik повысил <a href='tg://user?id={target.id}'>{target.first_name}</a>!\n"
+                f"🎖 <b>Новый статус:</b> <b>{rank_name}</b>\n\n"
+                f"🛡 <b>Полномочия:</b> Бан, Кик, Мут, Размут.{desc_extra}\n"
+                f"⚠️ <i>При сливе чата (3 наказания за 5 минут) ранг будет заморожен!</i>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━",
                 parse_mode=ParseMode.HTML
             )
@@ -761,9 +1030,9 @@ async def handle_chat_message(message: types.Message):
                 parse_mode=ParseMode.HTML
             )
 
-    # Проверка замороженного Суженого
+    # Проверка замороженного модератора
     if sender_data.get("is_frozen", 0) == 1 and (lower_text in ["бан", "кик", "размут"] or lower_text.startswith("мут")):
-        return await message.reply("🧊 <b>Твой статус Суженого заморожен!</b> Ты не можешь модерировать до решения @Leymik.", parse_mode=ParseMode.HTML)
+        return await message.reply("🧊 <b>Твой статус модератора заморожен!</b> Дождись разморозки от @Leymik.", parse_mode=ParseMode.HTML)
 
     # --- КОМАНДЫ МОДЕРАЦИИ ---
     if user_can_mod:
@@ -852,8 +1121,7 @@ async def handle_chat_message(message: types.Message):
             tags = " ".join([f"@{u}" for u in members])
             return await message.answer(f"📢 <b>ОБЩИЙ СБОР ЧАТА!</b>\n\n{tags}", parse_mode=ParseMode.HTML)
 
-    # --- КАЗИНО: КАМЕНЬ НОЖНИЦЫ БУМАГА ---
-    # Формат: "100 камень", "50 ножницы", "20 бумага"
+    # --- КАЗИНО: КАМЕНЬ НОЖНИЦЫ БУМАГА (ТОЛЬКО НА ЛИСТОЧКИ) ---
     rps_match = re.match(r"^(\d+)\s+(камень|ножницы|бумага)$", lower_text)
     if rps_match:
         bet_amount = int(rps_match.group(1))
@@ -867,25 +1135,21 @@ async def handle_chat_message(message: types.Message):
 
         choices = ["камень", "ножницы", "бумага"]
         bot_choice = random.choice(choices)
-
         icons = {"камень": "🪨 КАМЕНЬ", "ножницы": "✂️ НОЖНИЦЫ", "бумага": "📄 БУМАГА"}
 
-        # Проверка исхода
         if user_choice == bot_choice:
-            # Ничья: 0x, ставка не теряется
             return await message.reply(
                 f"🤝 <b>НИЧЬЯ В КНБ!</b> 🤝\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 Твой выбор: <b>{icons[user_choice]}</b>\n"
                 f"🤖 Выбор бота: <b>{icons[bot_choice]}</b>\n\n"
-                f"⚖️ Победитель не определен! Ставка <b>{bet_amount}</b> 🍁 возвращена на баланс.\n"
-                f"💰 Твой баланс: <b>{user['balance']}</b> 🍁",
+                f"⚖️ Ставка <b>{bet_amount}</b> 🍁 возвращена на баланс.\n"
+                f"💰 Баланс: <b>{user['balance']}</b> 🍁",
                 parse_mode=ParseMode.HTML
             )
         elif (user_choice == "камень" and bot_choice == "ножницы") or \
              (user_choice == "ножницы" and bot_choice == "бумага") or \
              (user_choice == "бумага" and bot_choice == "камень"):
-            # Победа игрока: 2.2x
             win_amount = int(bet_amount * 2.2)
             profit = win_amount - bet_amount
             new_bal = db.update_balance(user_id, profit)
@@ -894,19 +1158,18 @@ async def handle_chat_message(message: types.Message):
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 Твой выбор: <b>{icons[user_choice]}</b>\n"
                 f"🤖 Выбор бота: <b>{icons[bot_choice]}</b>\n\n"
-                f"🔥 Твоя комбинация сильнее! Выигрыш: <b>+{win_amount}</b> 🍁 листочек!\n"
-                f"💰 Текущий баланс: <b>{new_bal}</b> 🍁",
+                f"🔥 Выигрыш: <b>+{win_amount}</b> 🍁 листочек!\n"
+                f"💰 Новый баланс: <b>{new_bal}</b> 🍁",
                 parse_mode=ParseMode.HTML
             )
         else:
-            # Поражение: 0x
             new_bal = db.update_balance(user_id, -bet_amount)
             return await message.reply(
                 f"💀 <b>ПОРАЖЕНИЕ В КНБ!</b> 💀\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 Твой выбор: <b>{icons[user_choice]}</b>\n"
                 f"🤖 Выбор бота: <b>{icons[bot_choice]}</b>\n\n"
-                f"🥀 Бот переиграл тебя. Ставка <b>{bet_amount}</b> 🍁 листочек сгорела.\n"
+                f"🥀 Ставка <b>{bet_amount}</b> 🍁 сгорела.\n"
                 f"💰 Текущий баланс: <b>{new_bal}</b> 🍁",
                 parse_mode=ParseMode.HTML
             )
@@ -946,7 +1209,7 @@ async def handle_chat_message(message: types.Message):
             f"Люстра люстра няш няш аф аф люблю сочно сучку {target_tag}"
         )
 
-    # --- РП ДЕЙСТВИЯ: ОБНЯТЬ, ПОЦЕЛОВАТЬ, ВЫЕБАТЬ, ЛИЗЬ ---
+    # --- РП ДЕЙСТВИЯ ---
     rp_actions = {
         "обнять": ("обнял(а)", "крепко обнимает и согревает теплом"),
         "поцеловать": ("поцеловал(а)", "нежно и чувственно целует в губы"),
@@ -967,7 +1230,7 @@ async def handle_chat_message(message: types.Message):
             parse_mode=ParseMode.HTML
         )
 
-    # --- ПЛАТНЫЕ РП: ПОКУРИТЬ, ЗАКИНУТЬ СНЮС, ВЫПИТЬ (30 листочек) ---
+    # --- ПЛАТНЫЕ РП: ПОКУРИТЬ, ЗАКИНУТЬ СНЮС, ВЫПИТЬ ---
     if lower_text in ["покурить", "закинуть снюс", "выпить"]:
         act_type = "smoke" if lower_text == "покурить" else "snus" if lower_text == "закинуть снюс" else "drink"
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -990,11 +1253,14 @@ async def handle_chat_message(message: types.Message):
         t_data = db.get_user(target.id, target.username or "", target.first_name)
         t_stats = db.get_user_stats(target.id, msk_today)
 
+        rank_lvl = t_data.get("rank_level") or 0
         if target.id == LEYMIK_ID:
             rank = "👑 Главный Модератор"
         elif is_admin(target.id):
             rank = "🛡️ Администратор"
-        elif t_data.get("is_deputy") == 1:
+        elif rank_lvl == 2:
+            rank = "🧊 Вилочник (Заморожен)" if t_data.get("is_frozen", 0) == 1 else "🍴 Вилочник"
+        elif rank_lvl == 1:
             rank = "🧊 Суженый (Заморожен)" if t_data.get("is_frozen", 0) == 1 else "⚜️ Суженый Служенный"
         else:
             rank = "👤 Пользователь"
@@ -1021,7 +1287,8 @@ async def handle_chat_message(message: types.Message):
             f"🆔 <b>ID:</b> <code>{target.id}</code>\n"
             f"🎖 <b>Ранг:</b> <b>{rank}</b>\n"
             f"💍 <b>Семейное положение:</b> {marriage_status}\n"
-            f"💰 <b>Баланс:</b> <b>{t_data['balance']}</b> 🍁 листочек\n"
+            f"💰 <b>Листочки:</b> <b>{t_data.get('balance', 0)}</b> 🍁\n"
+            f"💎 <b>Атомы (Алмазы):</b> <b>{t_data.get('atoms', 0)}</b> ⚛️\n"
             f"📅 <b>Первый визит:</b> {joined_formatted}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>АКТИВНОСТЬ СООБЩЕНИЙ:</b>\n"
@@ -1043,7 +1310,7 @@ async def handle_chat_message(message: types.Message):
             return await message.reply("🤖 Моё сердце принадлежит коду!")
 
         if db.get_marriage(user_id):
-            return await message.reply("⚠️ Ты уже состоишь в браке! Чтобы сделать новое предложение, сначала напиши <b>\"развод\"</b>.", parse_mode=ParseMode.HTML)
+            return await message.reply("⚠️ Ты уже состоишь в браке! Напиши <b>\"развод\"</b> для расторжения.", parse_mode=ParseMode.HTML)
         if db.get_marriage(target.id):
             return await message.reply(f"💔 <a href='tg://user?id={target.id}'>{target.first_name}</a> уже в браке!", parse_mode=ParseMode.HTML)
 
@@ -1108,6 +1375,40 @@ async def handle_chat_message(message: types.Message):
         lines.append("━━━━━━━━━━━━━━━━━━━━━━")
         return await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
+    # --- ПЕРЕВОД АТОМОВ: "п (число) атомы" ---
+    atom_transfer_match = re.match(r"^п\s+(\d+)\s+атомы$", lower_text)
+    if atom_transfer_match:
+        if not message.reply_to_message:
+            return await message.reply("💎 Ответь этой командой на сообщение того, кому переводишь атомы!")
+        target = message.reply_to_message.from_user
+        if target.id == user_id:
+            return await message.reply("😅 Нельзя переводить валюту самому себе!")
+        if target.id == bot.id:
+            return await message.reply("🍃 Спасибо, но боту атомы не нужны!")
+
+        amount = int(atom_transfer_match.group(1))
+        if amount <= 0:
+            return await message.reply("⚠️ Сумма должна быть больше 0!")
+
+        sender = db.get_user(user_id, message.from_user.username or "", message.from_user.first_name)
+        if sender.get("atoms", 0) < amount:
+            return await message.reply(f"❌ <b>Недостаточно атомов!</b> Твой баланс: <b>{sender.get('atoms', 0)}</b> ⚛️", parse_mode=ParseMode.HTML)
+
+        db.get_user(target.id, target.username or "", target.first_name)
+        new_sender_atoms = db.update_atoms(user_id, -amount)
+        new_target_atoms = db.update_atoms(target.id, amount)
+
+        return await message.answer(
+            f"💎 <b>УСПЕШНЫЙ ПЕРЕВОД АТОМОВ</b> ⚛️\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Отправитель: <b><a href='tg://user?id={user_id}'>{message.from_user.first_name}</a></b>\n"
+            f"🎁 Получатель: <b><a href='tg://user?id={target.id}'>{target.first_name}</a></b>\n"
+            f"💎 Сумма: <b>{amount}</b> ⚛️ атомов\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Твой остаток атомов: <b>{new_sender_atoms}</b> ⚛️",
+            parse_mode=ParseMode.HTML
+        )
+
     # --- ПЕРЕВОД ЛИСТОЧКОВ: "п (число)" ---
     transfer_match = re.match(r"^п\s+(\d+)$", lower_text)
     if transfer_match:
@@ -1156,18 +1457,19 @@ async def handle_chat_message(message: types.Message):
         lines.append("━━━━━━━━━━━━━━━━━━━━━━\n⏰ <i>Итоги ровно в 00:00 по МСК! Победитель получает +500 🍁</i>")
         return await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
-    # --- БАЛАНС ---
+    # --- БАЛАНС (ЛИСТОЧКИ + АТОМЫ) ---
     if lower_text in ["б", "баланс"]:
         user = db.get_user(user_id, message.from_user.username or "", message.from_user.first_name)
         return await message.reply(
             f"🍃 <b>Кошелек: <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a></b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"💰 Баланс: <b>{user['balance']}</b> 🍁 листочек\n"
+            f"💰 Листочки: <b>{user.get('balance', 0)}</b> 🍁\n"
+            f"💎 Атомы (Алмазы): <b>{user.get('atoms', 0)}</b> ⚛️\n"
             f"━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML
         )
 
-    # --- РУЛЕТКА ("100 ч" / "50 к") ---
+    # --- РУЛЕТКА (ТОЛЬКО НА ЛИСТОЧКИ) ---
     bet_match = re.match(r"^(\d+)\s+([чк])$", lower_text)
     if bet_match:
         bet_amount = int(bet_match.group(1))
@@ -1258,7 +1560,7 @@ async def midnight_msk_scheduler():
             db.mark_reward_given(ended_day)
         await asyncio.sleep(5)
 
-# --- KEEP-ALIVE ТАСКА ---
+# --- KEEP-ALIVE ---
 async def keep_alive_task():
     await asyncio.sleep(10)
     if not RENDER_EXTERNAL_URL:
@@ -1277,7 +1579,6 @@ async def on_startup(app):
     await refresh_admin_cache()
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
-        # Передаем allowed_updates, чтобы Telegram отправлял и chat_join_request
         await bot.set_webhook(
             webhook_url,
             drop_pending_updates=True,
