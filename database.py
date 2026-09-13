@@ -27,6 +27,7 @@ def init_db():
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
+                display_name TEXT,
                 balance BIGINT DEFAULT 0,
                 atoms BIGINT DEFAULT 0,
                 warns INT DEFAULT 0,
@@ -84,8 +85,8 @@ def init_db():
                 PRIMARY KEY (giveaway_id, user_id)
             );
         """)
-        # Миграция колонок
-        columns = [
+        cols = [
+            ("display_name", "TEXT"),
             ("atoms", "BIGINT DEFAULT 0"),
             ("rank_level", "INT DEFAULT 0"),
             ("is_frozen", "INT DEFAULT 0"),
@@ -93,14 +94,15 @@ def init_db():
             ("rubles", "INT DEFAULT 0"),
             ("rubles_total", "INT DEFAULT 0")
         ]
-        for col, col_type in columns:
-            cursor.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {col_type};")
+        for col, col_t in cols:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {col_t};")
     else:
         cursor.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
+                display_name TEXT,
                 balance INTEGER DEFAULT 0,
                 atoms INTEGER DEFAULT 0,
                 warns INTEGER DEFAULT 0,
@@ -158,7 +160,7 @@ def init_db():
                 PRIMARY KEY (giveaway_id, user_id)
             );
         """)
-        for col in ["atoms INTEGER DEFAULT 0", "rank_level INTEGER DEFAULT 0", "is_frozen INTEGER DEFAULT 0", "referrer_id INTEGER DEFAULT NULL", "rubles INTEGER DEFAULT 0", "rubles_total INTEGER DEFAULT 0"]:
+        for col in ["display_name TEXT", "atoms INTEGER DEFAULT 0", "rank_level INTEGER DEFAULT 0", "is_frozen INTEGER DEFAULT 0", "referrer_id INTEGER DEFAULT NULL", "rubles INTEGER DEFAULT 0", "rubles_total INTEGER DEFAULT 0"]:
             try:
                 cursor.execute(f"ALTER TABLE users ADD COLUMN {col};")
             except Exception:
@@ -166,29 +168,37 @@ def init_db():
         conn.commit()
     conn.close()
 
+def make_display_name(username, first_name):
+    if username:
+        return f"@{username}"
+    return first_name or "Игрок"
+
 def get_user(user_id: int, username: str = "", first_name: str = ""):
     conn, mode = get_db()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) if mode == "pg" else conn.cursor()
-    safe_uname = username or ""
-    safe_fname = first_name or "Участник"
+    safe_u = (username or "").strip()
+    safe_f = (first_name or "").strip() or "Игрок"
+    disp = make_display_name(safe_u, safe_f)
 
     cursor.execute("SELECT * FROM users WHERE user_id = %s" if mode == "pg" else "SELECT * FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     if not user:
-        q = "INSERT INTO users (user_id, username, first_name, balance, atoms, joined_at) VALUES (%s, %s, %s, 0, 0, %s)" if mode == "pg" else \
-            "INSERT INTO users (user_id, username, first_name, balance, atoms, joined_at) VALUES (?, ?, ?, 0, 0, ?)"
-        cursor.execute(q, (user_id, safe_uname, safe_fname, now_str))
+        q = "INSERT INTO users (user_id, username, first_name, display_name, balance, atoms, joined_at) VALUES (%s, %s, %s, %s, 0, 0, %s)" if mode == "pg" else \
+            "INSERT INTO users (user_id, username, first_name, display_name, balance, atoms, joined_at) VALUES (?, ?, ?, ?, 0, 0, ?)"
+        cursor.execute(q, (user_id, safe_u, safe_f, disp, now_str))
         if mode == "sqlite": conn.commit()
         cursor.execute("SELECT * FROM users WHERE user_id = %s" if mode == "pg" else "SELECT * FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
     else:
-        if safe_uname or safe_fname:
-            q = "UPDATE users SET username = %s, first_name = %s WHERE user_id = %s" if mode == "pg" else \
-                "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?"
-            cursor.execute(q, (safe_uname or user["username"], safe_fname or user["first_name"], user_id))
-            if mode == "sqlite": conn.commit()
+        # Всегда освежаем ник и отображаемое имя!
+        q = "UPDATE users SET username = %s, first_name = %s, display_name = %s WHERE user_id = %s" if mode == "pg" else \
+            "UPDATE users SET username = ?, first_name = ?, display_name = ? WHERE user_id = ?"
+        cursor.execute(q, (safe_u, safe_f, disp, user_id))
+        if mode == "sqlite": conn.commit()
+        cursor.execute("SELECT * FROM users WHERE user_id = %s" if mode == "pg" else "SELECT * FROM users WHERE user_id = ?", (user_id,))
+        user = cursor.fetchone()
 
     res = dict(user)
     conn.close()
@@ -232,16 +242,16 @@ def get_referrals_count(user_id: int) -> int:
 
 def promote_rank(user_id: int) -> int:
     u = get_user(user_id)
-    current_rank = u.get("rank_level") or 0
-    new_rank = 1 if current_rank == 0 else 2
+    cur = u.get("rank_level") or 0
+    new_r = 1 if cur == 0 else 2
     conn, mode = get_db()
     cursor = conn.cursor()
     q = "UPDATE users SET rank_level = %s, is_frozen = 0 WHERE user_id = %s" if mode == "pg" else \
         "UPDATE users SET rank_level = ?, is_frozen = 0 WHERE user_id = ?"
-    cursor.execute(q, (new_rank, user_id))
+    cursor.execute(q, (new_r, user_id))
     if mode == "sqlite": conn.commit()
     conn.close()
-    return new_rank
+    return new_r
 
 def set_frozen(user_id: int, status: int = 1):
     conn, mode = get_db()
@@ -451,13 +461,13 @@ def get_top_daily(date_str: str, limit: int = 5):
     conn, mode = get_db()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) if mode == "pg" else conn.cursor()
     q = """
-        SELECT d.user_id, d.msg_count, u.first_name, u.username
+        SELECT d.user_id, d.msg_count, u.display_name, u.first_name, u.username
         FROM daily_activity d
         JOIN users u ON d.user_id = u.user_id
         WHERE d.date = %s
         ORDER BY d.msg_count DESC LIMIT %s
     """ if mode == "pg" else """
-        SELECT d.user_id, d.msg_count, u.first_name, u.username
+        SELECT d.user_id, d.msg_count, u.display_name, u.first_name, u.username
         FROM daily_activity d
         JOIN users u ON d.user_id = u.user_id
         WHERE d.date = ?
@@ -501,11 +511,20 @@ def create_giveaway(amount: int, currency: str, description: str, message_id: in
     conn.close()
     return gid
 
-def get_active_giveaway():
+def get_giveaway_by_id(gid: int):
     conn, mode = get_db()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) if mode == "pg" else conn.cursor()
-    q = "SELECT * FROM giveaways WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
-    cursor.execute(q)
+    q = "SELECT * FROM giveaways WHERE id = %s" if mode == "pg" else "SELECT * FROM giveaways WHERE id = ?"
+    cursor.execute(q, (gid,))
+    res = cursor.fetchone()
+    conn.close()
+    return dict(res) if res else None
+
+def get_giveaway_by_msg(msg_id: int):
+    conn, mode = get_db()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) if mode == "pg" else conn.cursor()
+    q = "SELECT * FROM giveaways WHERE message_id = %s AND is_active = 1" if mode == "pg" else "SELECT * FROM giveaways WHERE message_id = ? AND is_active = 1"
+    cursor.execute(q, (msg_id,))
     res = cursor.fetchone()
     conn.close()
     return dict(res) if res else None
